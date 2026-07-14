@@ -302,6 +302,20 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
+            # Left-right symmetry data-augmentation (faster): append mirrored obs/actions and
+            # repeat the rollout tensors, so the loss is evaluated on both views. Gated by
+            # symmetry_obs_fn (set post-construction); a no-op with n_real==full when unset.
+            n_real = idx.shape[0]
+            sym_obs_fn = getattr(self, 'symmetry_obs_fn', None)
+            if sym_obs_fn is not None:
+                mb_obs = torch.cat([mb_obs, sym_obs_fn(mb_obs)], 0)
+                mb_actions = torch.cat([mb_actions, self.symmetry_act_fn(mb_actions)], 0)
+                mb_logprobs = mb_logprobs.repeat(2, 1)
+                mb_values = mb_values.repeat(2, 1)
+                mb_returns = mb_returns.repeat(2, 1)
+                mb_advantages = mb_advantages.repeat(2, 1)
+                mb_prio = mb_prio.repeat(2, 1)
+
             prof.mark(1)
             logits, newvalue = self.policy(mb_obs)
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
@@ -311,7 +325,7 @@ class PuffeRL:
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
             logratio = newlogprob - mb_logprobs
             ratio = logratio.exp()
-            self.ratio[idx] = ratio.detach()
+            self.ratio[idx] = ratio[:n_real].detach()
 
             with torch.no_grad():
                 old_approx_kl = (-logratio).mean()
@@ -333,7 +347,7 @@ class PuffeRL:
 
             entropy_loss = entropy.mean()
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
-            val[idx] = newvalue.detach().float()
+            val[idx] = newvalue[:n_real].detach().float()
 
             losses['policy_loss'] += pg_loss
             losses['value_loss'] += v_loss
