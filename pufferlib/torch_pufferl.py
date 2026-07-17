@@ -83,23 +83,6 @@ def sample_logits(logits, action=None):
 
     return action.T, logprob.sum(0), logits_entropy
 
-def bounded_residual_mean(mean, anchor, limit, gate=1.0):
-    return anchor + gate * limit * torch.tanh((mean - anchor) / limit)
-
-
-def decayed_residual_gate(raw_gate, previous_gate, done, decay):
-    """Apply the reset-safe max/decay envelope used by bounded ETHZ residuals.
-
-    ``done`` is the boundary preceding the current observation.  Keeping this helper pure makes
-    the rollout contract easy to test and prevents a stale gate from leaking across episodes.
-    """
-    if decay >= 1.0:
-        return raw_gate
-    if not torch.is_tensor(raw_gate):
-        raw_gate = torch.full_like(previous_gate, float(raw_gate))
-    previous_gate = torch.where(done.reshape(-1, 1).bool(), torch.zeros_like(previous_gate), previous_gate)
-    return torch.maximum(raw_gate, decay * previous_gate)
-
 class _CudaPtr:
     '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
     __cuda_array_interface__ without any copy or C++ torch dependency.'''
@@ -202,22 +185,6 @@ class PuffeRL:
         self.state = policy.initial_state(total_agents, device=device)
         self.rollout_state = ()
         self.last_done = torch.zeros(total_agents, device=device)
-        self.behavior_anchor_policy = None
-        self.behavior_anchor_state = ()
-        self.behavior_anchor_actions = None
-        self.behavior_anchor_mask = None
-        self.behavior_anchor_coef = 0.0
-        self.behavior_residual_limit = None
-        self.behavior_residual_gate_fn = None
-        # Optional temporal envelope for a bounded residual.  A decay of 1.0 preserves the
-        # historical instantaneous gate path exactly; values below 1.0 retain a decaying gate
-        # after an impact and are reset at episode boundaries.
-        self.behavior_residual_gate_decay = 1.0
-        self.behavior_residual_gate_state = None
-        self.behavior_residual_gates = None
-        self.behavior_residual_prev_obs = None
-        self.behavior_residual_prev_valid = None
-        self.behavior_residual_prev_observations = None
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
@@ -261,32 +228,6 @@ class PuffeRL:
     def num_params(self):
         return self.model_size
 
-    def set_behavior_anchor(self, policy, coefficient, mask=None, residual_limit=None,
-                            gate_decay=1.0):
-        self.behavior_anchor_policy = policy.eval()
-        self.behavior_anchor_state = policy.initial_state(self.total_agents, device=self.device)
-        self.behavior_anchor_actions = torch.zeros_like(self.actions)
-        self.behavior_anchor_mask = mask
-        self.behavior_anchor_coef = float(coefficient)
-        self.behavior_residual_limit = residual_limit
-        self.behavior_residual_gate_decay = float(gate_decay)
-        if not 0.0 < self.behavior_residual_gate_decay <= 1.0:
-            raise ValueError("behavior residual gate decay must be in (0, 1]")
-        if residual_limit is not None:
-            self.behavior_residual_prev_obs = torch.zeros_like(self.vec_obs)
-            self.behavior_residual_prev_valid = torch.zeros(
-                self.total_agents, dtype=torch.bool, device=self.device
-            )
-            self.behavior_residual_prev_observations = torch.zeros_like(self.observations)
-            if self.behavior_residual_gate_decay < 1.0:
-                self.behavior_residual_gate_state = torch.zeros(
-                    self.total_agents, 1, dtype=torch.float32, device=self.device
-                )
-                self.behavior_residual_gates = torch.zeros(
-                    self.observations.shape[0], self.total_agents, 1,
-                    dtype=torch.float32, device=self.device
-                )
-
     def rollouts(self):
         prof = self.profile
         config = self.config
@@ -304,22 +245,8 @@ class PuffeRL:
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
 
-            previous_obs = None
-            if self.behavior_residual_prev_obs is not None:
-                done_device = torch.as_tensor(d, device=device).bool()
-                self.behavior_residual_prev_valid &= ~done_device
-                previous_obs = torch.where(
-                    self.behavior_residual_prev_valid.unsqueeze(-1),
-                    self.behavior_residual_prev_obs, o_device,
-                )
-                self.behavior_residual_prev_observations[t] = previous_obs
-
             if self.state:
                 self.state = _reset_state(self.state, torch.as_tensor(d, device=device))
-            if self.behavior_anchor_state:
-                self.behavior_anchor_state = _reset_state(
-                    self.behavior_anchor_state, torch.as_tensor(d, device=device)
-                )
 
             prof.mark(1)
             with torch.no_grad():
@@ -328,37 +255,6 @@ class PuffeRL:
                 else:
                     critic_o = torch.as_tensor(self.vec_critic_obs, device=device)
                     logits, value, state = self.policy.forward_eval(o_device, critic_o, self.state)
-                if self.behavior_anchor_policy is not None:
-                    if self.vec_critic_obs is None:
-                        anchor_logits, _, anchor_state = self.behavior_anchor_policy.forward_eval(
-                            o_device, self.behavior_anchor_state
-                        )
-                    else:
-                        anchor_logits, _, anchor_state = self.behavior_anchor_policy.forward_eval(
-                            o_device, critic_o, self.behavior_anchor_state
-                        )
-                    self.behavior_anchor_actions[t] = anchor_logits.mean
-                    self.behavior_anchor_state = anchor_state
-                    if self.behavior_residual_limit is not None:
-                        raw_gate = self.behavior_residual_gate_fn(o_device, previous_obs) \
-                            if self.behavior_residual_gate_fn is not None else 1.0
-                        if self.behavior_residual_gate_decay < 1.0:
-                            done_device = torch.as_tensor(d, device=device).bool()
-                            gate = decayed_residual_gate(
-                                raw_gate, self.behavior_residual_gate_state, done_device,
-                                self.behavior_residual_gate_decay,
-                            )
-                            self.behavior_residual_gate_state.copy_(gate)
-                            self.behavior_residual_gates[t] = gate
-                        else:
-                            gate = raw_gate
-                        logits = torch.distributions.Normal(
-                            bounded_residual_mean(
-                                logits.mean, anchor_logits.mean,
-                                self.behavior_residual_limit, gate,
-                            ),
-                            logits.scale,
-                        )
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
@@ -373,9 +269,6 @@ class PuffeRL:
                 self.terminals[t] = torch.as_tensor(d, device=device).float()
                 self.timeouts[t] = torch.as_tensor(timeout, device=device).float()
                 self.values[t] = value.view(self.total_agents, self.num_critics)
-                if self.behavior_residual_prev_obs is not None:
-                    self.behavior_residual_prev_obs.copy_(o_device)
-                    self.behavior_residual_prev_valid.fill_(True)
 
             prof.mark(2)
             actions_flat = _actions_for_vec_step(action)
@@ -424,12 +317,6 @@ class PuffeRL:
         critic_obs = self.critic_observations.transpose(0, 1).contiguous() \
             if self.critic_observations is not None else None
         act = self.actions.transpose(0, 1).contiguous()
-        anchor_act = self.behavior_anchor_actions.transpose(0, 1).contiguous() \
-            if self.behavior_anchor_actions is not None else None
-        prev_obs = self.behavior_residual_prev_observations.transpose(0, 1).contiguous() \
-            if self.behavior_residual_prev_observations is not None else None
-        residual_gates = self.behavior_residual_gates.transpose(0, 1).contiguous() \
-            if self.behavior_residual_gates is not None else None
         val = self.values.transpose(0, 1).contiguous()
         lp = self.logprobs.T.contiguous()
         # reward_clip=1.0 (default) reproduces the stock [-1,1] clamp; set null to disable (ethz needs
@@ -465,13 +352,8 @@ class PuffeRL:
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
             mb_obs = obs[idx]
-            mb_prev_obs = prev_obs[idx] if prev_obs is not None else None
-            mb_residual_gates = residual_gates[idx] if residual_gates is not None else None
             mb_critic_obs = critic_obs[idx] if critic_obs is not None else None
             mb_actions = act[idx]
-            mb_anchor_actions = anchor_act[idx] if anchor_act is not None else None
-            mb_anchor_mask = self.behavior_anchor_mask[idx] \
-                if self.behavior_anchor_mask is not None else None
             mb_logprobs = lp[idx]
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
@@ -485,16 +367,6 @@ class PuffeRL:
             if sym_obs_fn is not None:
                 mb_obs = torch.cat([mb_obs, sym_obs_fn(mb_obs)], 0)
                 mb_actions = torch.cat([mb_actions, self.symmetry_act_fn(mb_actions)], 0)
-                if mb_anchor_actions is not None:
-                    mb_anchor_actions = torch.cat([
-                        mb_anchor_actions, self.symmetry_act_fn(mb_anchor_actions)
-                    ], 0)
-                    if mb_anchor_mask is not None:
-                        mb_anchor_mask = mb_anchor_mask.repeat(2)
-                if prev_obs is not None:
-                    mb_prev_obs = torch.cat([mb_prev_obs, self.symmetry_obs_fn(mb_prev_obs)], 0)
-                if mb_residual_gates is not None:
-                    mb_residual_gates = mb_residual_gates.repeat(2, 1, 1)
                 mb_logprobs = mb_logprobs.repeat(2, 1)
                 mb_values = mb_values.repeat(2, 1, 1)
                 mb_returns = mb_returns.repeat(2, 1, 1)
@@ -508,22 +380,6 @@ class PuffeRL:
                 mb_state = tuple(s[:, idx].contiguous() for s in self.rollout_state)
                 logits, newvalue = self.policy.forward_train_recurrent(
                     mb_obs, mb_critic_obs, mb_state, ter[idx]
-                )
-            if self.behavior_residual_limit is not None:
-                if mb_residual_gates is not None:
-                    gate = mb_residual_gates
-                else:
-                    gate = self.behavior_residual_gate_fn(mb_obs, mb_prev_obs) \
-                        if self.behavior_residual_gate_fn is not None else 1.0
-                gate = gate.reshape(-1, 1)
-                logits = torch.distributions.Normal(
-                    bounded_residual_mean(
-                        logits.mean,
-                        mb_anchor_actions.reshape(logits.mean.shape),
-                        self.behavior_residual_limit,
-                        gate,
-                    ),
-                    logits.scale,
                 )
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
@@ -558,18 +414,7 @@ class PuffeRL:
             v_loss_groups = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean(dim=(0, 1))
 
             entropy_loss = entropy.mean()
-            anchor_loss = torch.zeros((), device=device)
-            if mb_anchor_actions is not None:
-                anchor_error = (
-                    logits.mean - mb_anchor_actions.reshape(logits.mean.shape)
-                ).square().mean(-1).reshape(mb_anchor_actions.shape[:2])
-                if mb_anchor_mask is None:
-                    anchor_loss = anchor_error.mean()
-                else:
-                    weights = mb_anchor_mask.float().unsqueeze(1).expand_as(anchor_error)
-                    anchor_loss = (anchor_error * weights).sum() / weights.sum().clamp(min=1.0)
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss \
-                + self.behavior_anchor_coef*anchor_loss
+            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
             val[idx] = newvalue[:n_real].detach().float()
 
             losses['policy_loss'] += pg_loss
@@ -577,7 +422,6 @@ class PuffeRL:
             for g in range(self.num_critics):
                 losses[f'value_loss_{g}'] += v_loss_groups[g]
             losses['entropy'] += entropy_loss
-            losses['behavior_anchor_loss'] += anchor_loss
             losses['old_approx_kl'] += old_approx_kl
             losses['approx_kl'] += approx_kl
             losses['clipfrac'] += clipfrac
