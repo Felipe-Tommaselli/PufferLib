@@ -195,6 +195,9 @@ class PuffeRL:
         self.behavior_anchor_coef = 0.0
         self.behavior_residual_limit = None
         self.behavior_residual_gate_fn = None
+        self.behavior_residual_prev_obs = None
+        self.behavior_residual_prev_valid = None
+        self.behavior_residual_prev_observations = None
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
@@ -245,6 +248,12 @@ class PuffeRL:
         self.behavior_anchor_mask = mask
         self.behavior_anchor_coef = float(coefficient)
         self.behavior_residual_limit = residual_limit
+        if residual_limit is not None:
+            self.behavior_residual_prev_obs = torch.zeros_like(self.vec_obs)
+            self.behavior_residual_prev_valid = torch.zeros(
+                self.total_agents, dtype=torch.bool, device=self.device
+            )
+            self.behavior_residual_prev_observations = torch.zeros_like(self.observations)
 
     def rollouts(self):
         prof = self.profile
@@ -262,6 +271,16 @@ class PuffeRL:
         self.rollout_state = tuple(s.clone() for s in self.state)
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
+
+            previous_obs = None
+            if self.behavior_residual_prev_obs is not None:
+                done_device = torch.as_tensor(d, device=device).bool()
+                self.behavior_residual_prev_valid &= ~done_device
+                previous_obs = torch.where(
+                    self.behavior_residual_prev_valid.unsqueeze(-1),
+                    self.behavior_residual_prev_obs, o_device,
+                )
+                self.behavior_residual_prev_observations[t] = previous_obs
 
             if self.state:
                 self.state = _reset_state(self.state, torch.as_tensor(d, device=device))
@@ -289,7 +308,7 @@ class PuffeRL:
                     self.behavior_anchor_actions[t] = anchor_logits.mean
                     self.behavior_anchor_state = anchor_state
                     if self.behavior_residual_limit is not None:
-                        gate = self.behavior_residual_gate_fn(o_device) \
+                        gate = self.behavior_residual_gate_fn(o_device, previous_obs) \
                             if self.behavior_residual_gate_fn is not None else 1.0
                         logits = torch.distributions.Normal(
                             bounded_residual_mean(
@@ -312,6 +331,9 @@ class PuffeRL:
                 self.terminals[t] = torch.as_tensor(d, device=device).float()
                 self.timeouts[t] = torch.as_tensor(timeout, device=device).float()
                 self.values[t] = value.view(self.total_agents, self.num_critics)
+                if self.behavior_residual_prev_obs is not None:
+                    self.behavior_residual_prev_obs.copy_(o_device)
+                    self.behavior_residual_prev_valid.fill_(True)
 
             prof.mark(2)
             actions_flat = _actions_for_vec_step(action)
@@ -362,6 +384,8 @@ class PuffeRL:
         act = self.actions.transpose(0, 1).contiguous()
         anchor_act = self.behavior_anchor_actions.transpose(0, 1).contiguous() \
             if self.behavior_anchor_actions is not None else None
+        prev_obs = self.behavior_residual_prev_observations.transpose(0, 1).contiguous() \
+            if self.behavior_residual_prev_observations is not None else None
         val = self.values.transpose(0, 1).contiguous()
         lp = self.logprobs.T.contiguous()
         # reward_clip=1.0 (default) reproduces the stock [-1,1] clamp; set null to disable (ethz needs
@@ -397,6 +421,7 @@ class PuffeRL:
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
             mb_obs = obs[idx]
+            mb_prev_obs = prev_obs[idx] if prev_obs is not None else None
             mb_critic_obs = critic_obs[idx] if critic_obs is not None else None
             mb_actions = act[idx]
             mb_anchor_actions = anchor_act[idx] if anchor_act is not None else None
@@ -421,6 +446,8 @@ class PuffeRL:
                     ], 0)
                     if mb_anchor_mask is not None:
                         mb_anchor_mask = mb_anchor_mask.repeat(2)
+                if prev_obs is not None:
+                    mb_prev_obs = torch.cat([mb_prev_obs, self.symmetry_obs_fn(mb_prev_obs)], 0)
                 mb_logprobs = mb_logprobs.repeat(2, 1)
                 mb_values = mb_values.repeat(2, 1, 1)
                 mb_returns = mb_returns.repeat(2, 1, 1)
@@ -436,7 +463,7 @@ class PuffeRL:
                     mb_obs, mb_critic_obs, mb_state, ter[idx]
                 )
             if self.behavior_residual_limit is not None:
-                gate = self.behavior_residual_gate_fn(mb_obs) \
+                gate = self.behavior_residual_gate_fn(mb_obs, mb_prev_obs) \
                     if self.behavior_residual_gate_fn is not None else 1.0
                 gate = gate.reshape(-1, 1)
                 logits = torch.distributions.Normal(
