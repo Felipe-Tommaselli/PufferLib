@@ -3,6 +3,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._higher_order_ops.scan import scan
+
+
+def _scan_step(carry, inputs):
+    coeff, value, reset = inputs
+    carry = torch.where(reset, torch.zeros_like(carry), carry)
+    carry = coeff * carry + value
+    return carry, carry.clone()
+
+
+@torch.compile(fullgraph=True)
+def _reset_scan(initial, coeff, value, resets):
+    return scan(_scan_step, initial, (coeff, value, resets.unsqueeze(-1)), dim=1)[1]
 
 class Policy(nn.Module):
     def __init__(self, encoder, decoder, network):
@@ -127,6 +140,12 @@ class MinGRU(nn.Module):
         a_star = log_coeffs.cumsum(dim=1)
         return (a_star + (log_values - a_star).logcumsumexp(dim=1)).exp()
 
+    def _heinsen_scan_initial(self, log_coeffs, log_values, initial):
+        a_star = log_coeffs.cumsum(dim=1)
+        initial = initial.clamp_min(0).log().unsqueeze(1)
+        terms = torch.cat([initial, log_values - a_star], dim=1).logcumsumexp(dim=1)[:, 1:]
+        return (a_star + terms).exp()
+
     def initial_state(self, batch_size, device):
         return (torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device),)
 
@@ -142,7 +161,27 @@ class MinGRU(nn.Module):
             state_out.append(out[:, -1:])
         return h.squeeze(1), (torch.stack(state_out, 0).squeeze(2),)
 
-    def forward_train(self, h):
+    def forward_train(self, h, state=None, resets=None):
+        if state is not None:
+            state = state[0]
+            for i in range(self.num_layers):
+                hidden, gate, proj = self.layers[i](h).chunk(3, dim=-1)
+                coeff = 1.0 - gate.sigmoid()
+                value = gate.sigmoid() * self._g(hidden)
+                initial = state[i]
+                if resets is not None and h.is_cuda:
+                    out = _reset_scan(initial, coeff, value, resets.bool())
+                elif resets is not None:
+                    prev, seq = initial, []
+                    for t in range(h.shape[1]):
+                        prev = prev.masked_fill(resets[:, t].bool().unsqueeze(-1), 0.0)
+                        prev = coeff[:, t] * prev + value[:, t]
+                        seq.append(prev)
+                    out = torch.stack(seq, dim=1)
+                else:
+                    out = self._heinsen_scan_initial(coeff.log(), value.log(), initial)
+                h = self._highway(h, out, proj)
+            return h
         T = h.shape[1]
         for i in range(self.num_layers):
             hidden, gate, proj = self.layers[i](h).chunk(3, dim=-1)

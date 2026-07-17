@@ -152,6 +152,8 @@ class PuffeRL:
                 (total_agents,), torch.float32))
             self.vec_timeouts = torch.as_tensor(_CudaPtr(vec.gpu_timeouts_ptr,
                 (total_agents,), torch.float32)) if hasattr(vec, 'gpu_timeouts_ptr') else None
+            self.vec_critic_obs = torch.as_tensor(_CudaPtr(vec.gpu_critic_obs_ptr,
+                (total_agents, vec.critic_obs_size), torch.float32)) if hasattr(vec, 'gpu_critic_obs_ptr') else None
         else:
             self.vec_obs = _cpu_tensor(vec.obs_ptr,
                 (total_agents, vec.obs_size), obs_dtype)
@@ -161,6 +163,8 @@ class PuffeRL:
                 (total_agents,), torch.float32)
             self.vec_timeouts = _cpu_tensor(vec.timeouts_ptr,
                 (total_agents,), torch.float32) if hasattr(vec, 'timeouts_ptr') else None
+            self.vec_critic_obs = _cpu_tensor(vec.critic_obs_ptr,
+                (total_agents, vec.critic_obs_size), torch.float32) if hasattr(vec, 'critic_obs_ptr') else None
 
         vec.reset()
         horizon = config['horizon']
@@ -168,6 +172,9 @@ class PuffeRL:
 
         self.observations = torch.zeros(horizon, total_agents, vec.obs_size,
             dtype=obs_dtype, device=device)
+        self.critic_observations = torch.zeros(
+            horizon, total_agents, vec.critic_obs_size, device=device
+        ) if self.vec_critic_obs is not None else None
         self.actions = torch.zeros(horizon, total_agents, num_atns, device=device)
         self.values = torch.zeros(horizon, total_agents, self.num_critics, device=device)
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
@@ -176,6 +183,8 @@ class PuffeRL:
         self.timeouts = torch.zeros(horizon, total_agents, device=device)
         self.ratio = torch.ones(total_agents, horizon, device=device)
         self.state = policy.initial_state(total_agents, device=device)
+        self.rollout_state = ()
+        self.last_done = torch.zeros(total_agents, device=device)
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
@@ -225,14 +234,14 @@ class PuffeRL:
         device = self.device
         horizon = config['horizon']
 
-        self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
         o = self.vec_obs
         r = torch.zeros(self.total_agents, self.num_critics, device=device)
-        d = torch.zeros(self.total_agents, device=device)
+        d = self.last_done
         timeout = torch.zeros(self.total_agents, device=device)
 
         P = Profile
         prof.mark(0)
+        self.rollout_state = tuple(s.clone() for s in self.state)
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
 
@@ -241,13 +250,19 @@ class PuffeRL:
 
             prof.mark(1)
             with torch.no_grad():
-                logits, value, state = self.policy.forward_eval(o_device, self.state)
+                if self.vec_critic_obs is None:
+                    logits, value, state = self.policy.forward_eval(o_device, self.state)
+                else:
+                    critic_o = torch.as_tensor(self.vec_critic_obs, device=device)
+                    logits, value, state = self.policy.forward_eval(o_device, critic_o, self.state)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
             with torch.no_grad():
                 self.state = state
                 self.observations[t] = o_device
+                if self.critic_observations is not None:
+                    self.critic_observations[t] = critic_o
                 self.actions[t] = action
                 self.logprobs[t] = logprob
                 self.rewards[t] = torch.as_tensor(r, device=device)
@@ -272,6 +287,7 @@ class PuffeRL:
 
         prof.mark(1)
         prof.elapsed(P.ROLLOUT, 0, 1)
+        self.last_done = torch.as_tensor(d, device=device).clone()
         self.global_step += self.total_agents * horizon
         self.env_logs = self._vec.log()
 
@@ -298,6 +314,8 @@ class PuffeRL:
         # Transpose from [horizon, agents(, G)] (contiguous writes) to [agents, horizon(, G)]
         # (minibatch indexing). val/rew carry the reward-group axis; ter/lp stay scalar-per-agent.
         obs = self.observations.transpose(0, 1).contiguous()
+        critic_obs = self.critic_observations.transpose(0, 1).contiguous() \
+            if self.critic_observations is not None else None
         act = self.actions.transpose(0, 1).contiguous()
         val = self.values.transpose(0, 1).contiguous()
         lp = self.logprobs.T.contiguous()
@@ -314,6 +332,7 @@ class PuffeRL:
         P = Profile
         prof.mark(0)
         num_minibatches = int(config['replay_ratio'] * self.batch_size / config['minibatch_size'])
+        updates = 0
         for mb in range(num_minibatches):
             # Per-group GAE: run the native scalar advantage kernel once per reward group and stack.
             # dones (ter) and the policy importance ratio are shared across groups (single actor).
@@ -333,6 +352,7 @@ class PuffeRL:
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
             mb_obs = obs[idx]
+            mb_critic_obs = critic_obs[idx] if critic_obs is not None else None
             mb_actions = act[idx]
             mb_logprobs = lp[idx]
             mb_values = val[idx]
@@ -354,7 +374,13 @@ class PuffeRL:
                 mb_prio = mb_prio.repeat(2, 1)
 
             prof.mark(1)
-            logits, newvalue = self.policy(mb_obs)
+            if mb_critic_obs is None:
+                logits, newvalue = self.policy(mb_obs)
+            else:
+                mb_state = tuple(s[:, idx].contiguous() for s in self.rollout_state)
+                logits, newvalue = self.policy.forward_train_recurrent(
+                    mb_obs, mb_critic_obs, mb_state, ter[idx]
+                )
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
@@ -402,14 +428,25 @@ class PuffeRL:
             losses['importance'] += ratio.mean()
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
             self.optimizer.step()
+            if hasattr(self.policy, 'clamp_logstd'):
+                self.policy.clamp_logstd()
             self.optimizer.zero_grad()
+            losses['grad_norm'] += grad_norm
+            updates += 1
+            target_kl = config.get('target_kl')
+            if target_kl is not None and approx_kl.item() > target_kl:
+                break
 
         prof.mark(1)
         prof.elapsed(P.TRAIN, 0, 1)
 
-        losses = {k: v.item() / num_minibatches for k, v in losses.items()}
+        losses = {k: v.item() / updates for k, v in losses.items()}
+        if hasattr(self.policy, 'action_logstd'):
+            losses['action_logstd_mean'] = self.policy.action_logstd.mean().item()
+            losses['action_logstd_max'] = self.policy.action_logstd.max().item()
+            losses['action_std_mean'] = self.policy.action_logstd.exp().mean().item()
         y_pred = val.flatten()
         y_true = advantages.flatten() + val.flatten()
         var_y = y_true.var()
@@ -468,6 +505,7 @@ class PuffeRL:
         self.vec_rewards = None
         self.vec_terminals = None
         self.vec_timeouts = None
+        self.vec_critic_obs = None
         self._vec.close()
 
     @classmethod
