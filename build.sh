@@ -56,7 +56,19 @@ if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_LIB=-lomp5
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
-    STANDALONE_LDFLAGS=(-lGL)
+    # Some Linux systems only ship the versioned runtime lib (libGL.so.1), not the unversioned
+    # dev symlink -lGL expects; fall back to linking it directly rather than requiring a package
+    # install.
+    GL_LDFLAG=-lGL
+    if ! ldconfig -p 2>/dev/null | grep -q 'libGL\.so$'; then
+        for candidate in /usr/lib/x86_64-linux-gnu/libGL.so.1 /usr/lib/libGL.so.1 /usr/lib64/libGL.so.1; do
+            if [ -f "$candidate" ]; then
+                GL_LDFLAG="$candidate"
+                break
+            fi
+        done
+    fi
+    STANDALONE_LDFLAGS=("$GL_LDFLAG")
     SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
@@ -66,15 +78,20 @@ else
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
 fi
 
-CLANG_WARN=(
-    -Wall
-    -ferror-limit=3
-    -Werror=incompatible-pointer-types
-    -Werror=return-type
-    -Wno-error=incompatible-pointer-types-discards-qualifiers
-    -Wno-incompatible-pointer-types-discards-qualifiers
-    -Wno-error=array-parameter
-)
+# -ferror-limit and the -W(no-)error spellings below are clang-specific; skip them under gcc
+# (CC=gcc bash build.sh ...) rather than failing to parse.
+CLANG_WARN=()
+if [[ "${CC:-clang}" == *clang* ]]; then
+    CLANG_WARN=(
+        -Wall
+        -ferror-limit=3
+        -Werror=incompatible-pointer-types
+        -Werror=return-type
+        -Wno-error=incompatible-pointer-types-discards-qualifiers
+        -Wno-incompatible-pointer-types-discards-qualifiers
+        -Wno-error=array-parameter
+    )
+fi
 
 download() {
     local name=$1 url=$2
