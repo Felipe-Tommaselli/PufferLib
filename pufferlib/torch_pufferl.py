@@ -188,6 +188,7 @@ class PuffeRL:
         self.behavior_anchor_policy = None
         self.behavior_anchor_state = ()
         self.behavior_anchor_actions = None
+        self.behavior_anchor_mask = None
         self.behavior_anchor_coef = 0.0
 
         self.batch_size = total_agents * horizon
@@ -232,10 +233,11 @@ class PuffeRL:
     def num_params(self):
         return self.model_size
 
-    def set_behavior_anchor(self, policy, coefficient):
+    def set_behavior_anchor(self, policy, coefficient, mask=None):
         self.behavior_anchor_policy = policy.eval()
         self.behavior_anchor_state = policy.initial_state(self.total_agents, device=self.device)
         self.behavior_anchor_actions = torch.zeros_like(self.actions)
+        self.behavior_anchor_mask = mask
         self.behavior_anchor_coef = float(coefficient)
 
     def rollouts(self):
@@ -382,6 +384,8 @@ class PuffeRL:
             mb_critic_obs = critic_obs[idx] if critic_obs is not None else None
             mb_actions = act[idx]
             mb_anchor_actions = anchor_act[idx] if anchor_act is not None else None
+            mb_anchor_mask = self.behavior_anchor_mask[idx] \
+                if self.behavior_anchor_mask is not None else None
             mb_logprobs = lp[idx]
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
@@ -399,6 +403,8 @@ class PuffeRL:
                     mb_anchor_actions = torch.cat([
                         mb_anchor_actions, self.symmetry_act_fn(mb_anchor_actions)
                     ], 0)
+                    if mb_anchor_mask is not None:
+                        mb_anchor_mask = mb_anchor_mask.repeat(2)
                 mb_logprobs = mb_logprobs.repeat(2, 1)
                 mb_values = mb_values.repeat(2, 1, 1)
                 mb_returns = mb_returns.repeat(2, 1, 1)
@@ -448,9 +454,14 @@ class PuffeRL:
             entropy_loss = entropy.mean()
             anchor_loss = torch.zeros((), device=device)
             if mb_anchor_actions is not None:
-                anchor_loss = (
+                anchor_error = (
                     logits.mean - mb_anchor_actions.reshape(logits.mean.shape)
-                ).square().mean()
+                ).square().mean(-1).reshape(mb_anchor_actions.shape[:2])
+                if mb_anchor_mask is None:
+                    anchor_loss = anchor_error.mean()
+                else:
+                    weights = mb_anchor_mask.float().unsqueeze(1).expand_as(anchor_error)
+                    anchor_loss = (anchor_error * weights).sum() / weights.sum().clamp(min=1.0)
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss \
                 + self.behavior_anchor_coef*anchor_loss
             val[idx] = newvalue[:n_real].detach().float()
