@@ -7,7 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch._higher_order_ops.scan import scan
 
-_CAN_COMPILE_SCAN = os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h"))
+# Some PyTorch releases compile the higher-order scan with a stale batch guard when a recurrent
+# minibatch is sampled with replacement.  Keep the capability auto-detection, but allow a process
+# to force the exact sequential fallback for portable smoke/debug runs.
+_CAN_COMPILE_SCAN = (
+    os.environ.get("PUFFER_COMPILE_SCAN", "1") != "0"
+    and os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h"))
+)
 
 
 def _scan_step(carry, inputs):
