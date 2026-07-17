@@ -1,9 +1,13 @@
 import numpy as np
+import os
+import sysconfig
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch._higher_order_ops.scan import scan
+
+_CAN_COMPILE_SCAN = os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h"))
 
 
 def _scan_step(carry, inputs):
@@ -169,7 +173,7 @@ class MinGRU(nn.Module):
                 coeff = 1.0 - gate.sigmoid()
                 value = gate.sigmoid() * self._g(hidden)
                 initial = state[i]
-                if resets is not None and h.is_cuda:
+                if resets is not None and h.is_cuda and _CAN_COMPILE_SCAN:
                     out = _reset_scan(initial, coeff, value, resets.bool())
                 elif resets is not None:
                     prev, seq = initial, []
