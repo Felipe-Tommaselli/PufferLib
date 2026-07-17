@@ -185,6 +185,10 @@ class PuffeRL:
         self.state = policy.initial_state(total_agents, device=device)
         self.rollout_state = ()
         self.last_done = torch.zeros(total_agents, device=device)
+        self.behavior_anchor_policy = None
+        self.behavior_anchor_state = ()
+        self.behavior_anchor_actions = None
+        self.behavior_anchor_coef = 0.0
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
@@ -228,6 +232,12 @@ class PuffeRL:
     def num_params(self):
         return self.model_size
 
+    def set_behavior_anchor(self, policy, coefficient):
+        self.behavior_anchor_policy = policy.eval()
+        self.behavior_anchor_state = policy.initial_state(self.total_agents, device=self.device)
+        self.behavior_anchor_actions = torch.zeros_like(self.actions)
+        self.behavior_anchor_coef = float(coefficient)
+
     def rollouts(self):
         prof = self.profile
         config = self.config
@@ -247,6 +257,10 @@ class PuffeRL:
 
             if self.state:
                 self.state = _reset_state(self.state, torch.as_tensor(d, device=device))
+            if self.behavior_anchor_state:
+                self.behavior_anchor_state = _reset_state(
+                    self.behavior_anchor_state, torch.as_tensor(d, device=device)
+                )
 
             prof.mark(1)
             with torch.no_grad():
@@ -255,6 +269,17 @@ class PuffeRL:
                 else:
                     critic_o = torch.as_tensor(self.vec_critic_obs, device=device)
                     logits, value, state = self.policy.forward_eval(o_device, critic_o, self.state)
+                if self.behavior_anchor_policy is not None:
+                    if self.vec_critic_obs is None:
+                        anchor_logits, _, anchor_state = self.behavior_anchor_policy.forward_eval(
+                            o_device, self.behavior_anchor_state
+                        )
+                    else:
+                        anchor_logits, _, anchor_state = self.behavior_anchor_policy.forward_eval(
+                            o_device, critic_o, self.behavior_anchor_state
+                        )
+                    self.behavior_anchor_actions[t] = anchor_logits.mean
+                    self.behavior_anchor_state = anchor_state
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
@@ -317,6 +342,8 @@ class PuffeRL:
         critic_obs = self.critic_observations.transpose(0, 1).contiguous() \
             if self.critic_observations is not None else None
         act = self.actions.transpose(0, 1).contiguous()
+        anchor_act = self.behavior_anchor_actions.transpose(0, 1).contiguous() \
+            if self.behavior_anchor_actions is not None else None
         val = self.values.transpose(0, 1).contiguous()
         lp = self.logprobs.T.contiguous()
         # reward_clip=1.0 (default) reproduces the stock [-1,1] clamp; set null to disable (ethz needs
@@ -354,6 +381,7 @@ class PuffeRL:
             mb_obs = obs[idx]
             mb_critic_obs = critic_obs[idx] if critic_obs is not None else None
             mb_actions = act[idx]
+            mb_anchor_actions = anchor_act[idx] if anchor_act is not None else None
             mb_logprobs = lp[idx]
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
@@ -367,6 +395,10 @@ class PuffeRL:
             if sym_obs_fn is not None:
                 mb_obs = torch.cat([mb_obs, sym_obs_fn(mb_obs)], 0)
                 mb_actions = torch.cat([mb_actions, self.symmetry_act_fn(mb_actions)], 0)
+                if mb_anchor_actions is not None:
+                    mb_anchor_actions = torch.cat([
+                        mb_anchor_actions, self.symmetry_act_fn(mb_anchor_actions)
+                    ], 0)
                 mb_logprobs = mb_logprobs.repeat(2, 1)
                 mb_values = mb_values.repeat(2, 1, 1)
                 mb_returns = mb_returns.repeat(2, 1, 1)
@@ -414,7 +446,13 @@ class PuffeRL:
             v_loss_groups = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean(dim=(0, 1))
 
             entropy_loss = entropy.mean()
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+            anchor_loss = torch.zeros((), device=device)
+            if mb_anchor_actions is not None:
+                anchor_loss = (
+                    logits.mean - mb_anchor_actions.reshape(logits.mean.shape)
+                ).square().mean()
+            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss \
+                + self.behavior_anchor_coef*anchor_loss
             val[idx] = newvalue[:n_real].detach().float()
 
             losses['policy_loss'] += pg_loss
@@ -422,6 +460,7 @@ class PuffeRL:
             for g in range(self.num_critics):
                 losses[f'value_loss_{g}'] += v_loss_groups[g]
             losses['entropy'] += entropy_loss
+            losses['behavior_anchor_loss'] += anchor_loss
             losses['old_approx_kl'] += old_approx_kl
             losses['approx_kl'] += approx_kl
             losses['clipfrac'] += clipfrac
