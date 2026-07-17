@@ -83,6 +83,9 @@ def sample_logits(logits, action=None):
 
     return action.T, logprob.sum(0), logits_entropy
 
+def bounded_residual_mean(mean, anchor, limit):
+    return anchor + limit * torch.tanh((mean - anchor) / limit)
+
 class _CudaPtr:
     '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
     __cuda_array_interface__ without any copy or C++ torch dependency.'''
@@ -190,6 +193,7 @@ class PuffeRL:
         self.behavior_anchor_actions = None
         self.behavior_anchor_mask = None
         self.behavior_anchor_coef = 0.0
+        self.behavior_residual_limit = None
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
@@ -233,12 +237,13 @@ class PuffeRL:
     def num_params(self):
         return self.model_size
 
-    def set_behavior_anchor(self, policy, coefficient, mask=None):
+    def set_behavior_anchor(self, policy, coefficient, mask=None, residual_limit=None):
         self.behavior_anchor_policy = policy.eval()
         self.behavior_anchor_state = policy.initial_state(self.total_agents, device=self.device)
         self.behavior_anchor_actions = torch.zeros_like(self.actions)
         self.behavior_anchor_mask = mask
         self.behavior_anchor_coef = float(coefficient)
+        self.behavior_residual_limit = residual_limit
 
     def rollouts(self):
         prof = self.profile
@@ -282,6 +287,13 @@ class PuffeRL:
                         )
                     self.behavior_anchor_actions[t] = anchor_logits.mean
                     self.behavior_anchor_state = anchor_state
+                    if self.behavior_residual_limit is not None:
+                        logits = torch.distributions.Normal(
+                            bounded_residual_mean(
+                                logits.mean, anchor_logits.mean, self.behavior_residual_limit
+                            ),
+                            logits.scale,
+                        )
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
@@ -418,6 +430,15 @@ class PuffeRL:
                 mb_state = tuple(s[:, idx].contiguous() for s in self.rollout_state)
                 logits, newvalue = self.policy.forward_train_recurrent(
                     mb_obs, mb_critic_obs, mb_state, ter[idx]
+                )
+            if self.behavior_residual_limit is not None:
+                logits = torch.distributions.Normal(
+                    bounded_residual_mean(
+                        logits.mean,
+                        mb_anchor_actions.reshape(logits.mean.shape),
+                        self.behavior_residual_limit,
+                    ),
+                    logits.scale,
                 )
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
