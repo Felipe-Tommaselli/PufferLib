@@ -104,6 +104,16 @@ def _actions_for_vec_step(action):
         action = action.unsqueeze(-1)
     return action.to(dtype=torch.float32).contiguous()
 
+def _reset_state(state, dones):
+    if not state:
+        return ()
+    mask = dones.bool().view(1, -1, 1)
+    return tuple(s.masked_fill(mask, 0.0) for s in state)
+
+def _bootstrap_timeouts(rewards, values, timeouts, gamma):
+    rewards[:, 1:] += gamma * values[:, :-1] * timeouts[:, 1:].unsqueeze(-1)
+    return rewards
+
 def _cpu_tensor(ptr, shape, dtype):
     '''Zero-copy CPU tensor from a raw pointer via ctypes.'''
     ctype = _TORCH_TO_CTYPE[dtype]
@@ -129,20 +139,28 @@ class PuffeRL:
         self.total_agents = total_agents
         obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
 
+        # Multi-critic: the vec supplies a [total_agents, G] reward buffer (G reward groups).
+        # G=1 (default) views the stock 1-D reward buffer as [total_agents, 1] -- byte-identical path.
+        self.num_critics = getattr(vec, 'num_critics', 1)
+
         if self.gpu:
             self.vec_obs = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
                 (total_agents, vec.obs_size), obs_dtype))
             self.vec_rewards = torch.as_tensor(_CudaPtr(vec.gpu_rewards_ptr,
-                (total_agents,), torch.float32))
+                (total_agents, self.num_critics), torch.float32))
             self.vec_terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
                 (total_agents,), torch.float32))
+            self.vec_timeouts = torch.as_tensor(_CudaPtr(vec.gpu_timeouts_ptr,
+                (total_agents,), torch.float32)) if hasattr(vec, 'gpu_timeouts_ptr') else None
         else:
             self.vec_obs = _cpu_tensor(vec.obs_ptr,
                 (total_agents, vec.obs_size), obs_dtype)
             self.vec_rewards = _cpu_tensor(vec.rewards_ptr,
-                (total_agents,), torch.float32)
+                (total_agents, self.num_critics), torch.float32)
             self.vec_terminals = _cpu_tensor(vec.terminals_ptr,
                 (total_agents,), torch.float32)
+            self.vec_timeouts = _cpu_tensor(vec.timeouts_ptr,
+                (total_agents,), torch.float32) if hasattr(vec, 'timeouts_ptr') else None
 
         vec.reset()
         horizon = config['horizon']
@@ -151,10 +169,11 @@ class PuffeRL:
         self.observations = torch.zeros(horizon, total_agents, vec.obs_size,
             dtype=obs_dtype, device=device)
         self.actions = torch.zeros(horizon, total_agents, num_atns, device=device)
-        self.values = torch.zeros(horizon, total_agents, device=device)
+        self.values = torch.zeros(horizon, total_agents, self.num_critics, device=device)
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
-        self.rewards = torch.zeros(horizon, total_agents, device=device)
+        self.rewards = torch.zeros(horizon, total_agents, self.num_critics, device=device)
         self.terminals = torch.zeros(horizon, total_agents, device=device)
+        self.timeouts = torch.zeros(horizon, total_agents, device=device)
         self.ratio = torch.ones(total_agents, horizon, device=device)
         self.state = policy.initial_state(total_agents, device=device)
 
@@ -208,13 +227,17 @@ class PuffeRL:
 
         self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
         o = self.vec_obs
-        r = torch.zeros(self.total_agents, device=device)
+        r = torch.zeros(self.total_agents, self.num_critics, device=device)
         d = torch.zeros(self.total_agents, device=device)
+        timeout = torch.zeros(self.total_agents, device=device)
 
         P = Profile
         prof.mark(0)
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
+
+            if self.state:
+                self.state = _reset_state(self.state, torch.as_tensor(d, device=device))
 
             prof.mark(1)
             with torch.no_grad():
@@ -229,7 +252,8 @@ class PuffeRL:
                 self.logprobs[t] = logprob
                 self.rewards[t] = torch.as_tensor(r, device=device)
                 self.terminals[t] = torch.as_tensor(d, device=device).float()
-                self.values[t] = value.flatten()
+                self.timeouts[t] = torch.as_tensor(timeout, device=device).float()
+                self.values[t] = value.view(self.total_agents, self.num_critics)
 
             prof.mark(2)
             actions_flat = _actions_for_vec_step(action)
@@ -241,6 +265,7 @@ class PuffeRL:
                 self._vec.cpu_step(actions_flat.data_ptr())
 
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
+            timeout = self.vec_timeouts if self.vec_timeouts is not None else timeout.zero_()
             prof.mark(3)
             prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)
@@ -270,25 +295,37 @@ class PuffeRL:
             learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
             self.optimizer.param_groups[0]['lr'] = learning_rate
 
-        # Transpose from [horizon, agents] (contiguous writes) to [agents, horizon] (minibatch indexing)
+        # Transpose from [horizon, agents(, G)] (contiguous writes) to [agents, horizon(, G)]
+        # (minibatch indexing). val/rew carry the reward-group axis; ter/lp stay scalar-per-agent.
         obs = self.observations.transpose(0, 1).contiguous()
         act = self.actions.transpose(0, 1).contiguous()
-        val = self.values.T.contiguous()
+        val = self.values.transpose(0, 1).contiguous()
         lp = self.logprobs.T.contiguous()
-        rew = self.rewards.T.contiguous().clamp(-1, 1)
+        # reward_clip=1.0 (default) reproduces the stock [-1,1] clamp; set null to disable (ethz needs
+        # the is_terminated=-400 penalty to survive).
+        reward_clip = config.get('reward_clip', 1.0)
+        rew = self.rewards.transpose(0, 1).contiguous()
+        if reward_clip is not None:
+            rew = rew.clamp(-reward_clip, reward_clip)
         ter = self.terminals.T.contiguous()
+        timeouts = self.timeouts.T.contiguous()
+        rew = _bootstrap_timeouts(rew, val, timeouts, config['gamma'])
 
         P = Profile
         prof.mark(0)
         num_minibatches = int(config['replay_ratio'] * self.batch_size / config['minibatch_size'])
         for mb in range(num_minibatches):
-            shape = val.shape
-            advantages = torch.zeros(shape, device=device)
-            advantages = compute_puff_advantage(val, rew,
-                ter, self.ratio, advantages, config['gamma'],
-                config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            # Per-group GAE: run the native scalar advantage kernel once per reward group and stack.
+            # dones (ter) and the policy importance ratio are shared across groups (single actor).
+            advantages = torch.zeros_like(val)
+            for g in range(self.num_critics):
+                adv_g = torch.zeros_like(val[..., g])
+                adv_g = compute_puff_advantage(val[..., g].contiguous(), rew[..., g].contiguous(),
+                    ter, self.ratio, adv_g, config['gamma'],
+                    config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+                advantages[..., g] = adv_g
 
-            adv = advantages.abs().sum(axis=1)
+            adv = advantages.abs().sum(axis=(1, 2))
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs,
@@ -311,9 +348,9 @@ class PuffeRL:
                 mb_obs = torch.cat([mb_obs, sym_obs_fn(mb_obs)], 0)
                 mb_actions = torch.cat([mb_actions, self.symmetry_act_fn(mb_actions)], 0)
                 mb_logprobs = mb_logprobs.repeat(2, 1)
-                mb_values = mb_values.repeat(2, 1)
-                mb_returns = mb_returns.repeat(2, 1)
-                mb_advantages = mb_advantages.repeat(2, 1)
+                mb_values = mb_values.repeat(2, 1, 1)
+                mb_returns = mb_returns.repeat(2, 1, 1)
+                mb_advantages = mb_advantages.repeat(2, 1, 1)
                 mb_prio = mb_prio.repeat(2, 1)
 
             prof.mark(1)
@@ -332,18 +369,23 @@ class PuffeRL:
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
+            # Normalize each critic's advantage independently (over segments+time, keep group axis),
+            # then sum groups into one scalar advantage for the shared policy surrogate (paper eq.).
             adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
+            adv = mb_prio * adv.sum(-1)
 
             pg_loss1 = -adv * ratio
             pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
+            # Per-critic clipped value loss, summed over groups (each critic against its own returns).
             newvalue = newvalue.view(mb_returns.shape)
             v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
             v_loss_unclipped = (newvalue - mb_returns) ** 2
             v_loss_clipped = (v_clipped - mb_returns) ** 2
-            v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
+            v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean(dim=(0, 1)).sum()
+            v_loss_groups = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean(dim=(0, 1))
 
             entropy_loss = entropy.mean()
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
@@ -351,6 +393,8 @@ class PuffeRL:
 
             losses['policy_loss'] += pg_loss
             losses['value_loss'] += v_loss
+            for g in range(self.num_critics):
+                losses[f'value_loss_{g}'] += v_loss_groups[g]
             losses['entropy'] += entropy_loss
             losses['old_approx_kl'] += old_approx_kl
             losses['approx_kl'] += approx_kl
@@ -371,6 +415,13 @@ class PuffeRL:
         var_y = y_true.var()
         explained_var = torch.nan if var_y == 0 else (1 - (y_true - y_pred).var() / var_y).item()
         losses['explained_variance'] = explained_var
+        for g in range(self.num_critics):
+            y_pred_g = val[..., g].flatten()
+            y_true_g = advantages[..., g].flatten() + y_pred_g
+            var_g = y_true_g.var()
+            losses[f'explained_variance_{g}'] = (
+                torch.nan if var_g == 0 else (1 - (y_true_g - y_pred_g).var() / var_g).item()
+            )
 
         self.losses = losses
         self.epoch += 1
@@ -416,6 +467,7 @@ class PuffeRL:
         self.vec_obs = None
         self.vec_rewards = None
         self.vec_terminals = None
+        self.vec_timeouts = None
         self._vec.close()
 
     @classmethod
@@ -527,4 +579,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

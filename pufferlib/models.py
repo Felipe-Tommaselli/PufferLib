@@ -25,7 +25,7 @@ class Policy(nn.Module):
         h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
         h = self.network.forward_train(h.reshape(B, TT, -1))
         logits, values = self.decoder(h.reshape(B*TT, -1))
-        return logits, values.reshape(B, TT)
+        return logits, values.reshape(B, TT, -1)  # [B, TT, num_critics]
 
 class DefaultEncoder(nn.Module):
     def __init__(self, obs_size, hidden_size=128):
@@ -58,7 +58,7 @@ class MinimalEntityEncoder(nn.Module):
         return self.encoder(cat).max(dim=1)[0]
 
 class DefaultDecoder(nn.Module):
-    def __init__(self, nvec, hidden_size=128):
+    def __init__(self, nvec, hidden_size=128, num_critics=1):
         super().__init__()
         self.nvec = tuple(nvec)
         self.is_continuous = sum(nvec) == len(nvec)
@@ -70,7 +70,8 @@ class DefaultDecoder(nn.Module):
         else:
             self.decoder = nn.Linear(hidden_size, int(np.sum(nvec)))
 
-        self.value_function = nn.Linear(hidden_size, 1)
+        # One scalar value per reward group (critic). num_critics=1 keeps the stock single-critic head.
+        self.value_function = nn.Linear(hidden_size, num_critics)
 
     def forward(self, hidden):
         if self.is_continuous:
