@@ -83,8 +83,8 @@ def sample_logits(logits, action=None):
 
     return action.T, logprob.sum(0), logits_entropy
 
-def bounded_residual_mean(mean, anchor, limit):
-    return anchor + limit * torch.tanh((mean - anchor) / limit)
+def bounded_residual_mean(mean, anchor, limit, gate=1.0):
+    return anchor + gate * limit * torch.tanh((mean - anchor) / limit)
 
 class _CudaPtr:
     '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
@@ -194,6 +194,7 @@ class PuffeRL:
         self.behavior_anchor_mask = None
         self.behavior_anchor_coef = 0.0
         self.behavior_residual_limit = None
+        self.behavior_residual_gate_fn = None
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
@@ -288,9 +289,12 @@ class PuffeRL:
                     self.behavior_anchor_actions[t] = anchor_logits.mean
                     self.behavior_anchor_state = anchor_state
                     if self.behavior_residual_limit is not None:
+                        gate = self.behavior_residual_gate_fn(o_device) \
+                            if self.behavior_residual_gate_fn is not None else 1.0
                         logits = torch.distributions.Normal(
                             bounded_residual_mean(
-                                logits.mean, anchor_logits.mean, self.behavior_residual_limit
+                                logits.mean, anchor_logits.mean,
+                                self.behavior_residual_limit, gate,
                             ),
                             logits.scale,
                         )
@@ -432,11 +436,15 @@ class PuffeRL:
                     mb_obs, mb_critic_obs, mb_state, ter[idx]
                 )
             if self.behavior_residual_limit is not None:
+                gate = self.behavior_residual_gate_fn(mb_obs) \
+                    if self.behavior_residual_gate_fn is not None else 1.0
+                gate = gate.reshape(-1, 1)
                 logits = torch.distributions.Normal(
                     bounded_residual_mean(
                         logits.mean,
                         mb_anchor_actions.reshape(logits.mean.shape),
                         self.behavior_residual_limit,
+                        gate,
                     ),
                     logits.scale,
                 )
