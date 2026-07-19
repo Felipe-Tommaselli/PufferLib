@@ -367,6 +367,10 @@ class PuffeRL:
             if sym_obs_fn is not None:
                 mb_obs = torch.cat([mb_obs, sym_obs_fn(mb_obs)], 0)
                 mb_actions = torch.cat([mb_actions, self.symmetry_act_fn(mb_actions)], 0)
+                if mb_critic_obs is not None:
+                    mirror_critic = getattr(self, 'symmetry_critic_obs_fn', None)
+                    mirrored = mirror_critic(mb_critic_obs) if mirror_critic else mb_critic_obs
+                    mb_critic_obs = torch.cat([mb_critic_obs, mirrored], 0)
                 mb_logprobs = mb_logprobs.repeat(2, 1)
                 mb_values = mb_values.repeat(2, 1, 1)
                 mb_returns = mb_returns.repeat(2, 1, 1)
@@ -377,9 +381,11 @@ class PuffeRL:
             if mb_critic_obs is None:
                 logits, newvalue = self.policy(mb_obs)
             else:
-                mb_state = tuple(s[:, idx].contiguous() for s in self.rollout_state)
+                copies = 2 if sym_obs_fn is not None else 1
+                mb_state = tuple(s[:, idx].contiguous().repeat(1, copies, 1) for s in self.rollout_state)
+                mb_resets = ter[idx].repeat(copies, 1)
                 logits, newvalue = self.policy.forward_train_recurrent(
-                    mb_obs, mb_critic_obs, mb_state, ter[idx]
+                    mb_obs, mb_critic_obs, mb_state, mb_resets
                 )
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
