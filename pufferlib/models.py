@@ -50,6 +50,15 @@ class Policy(nn.Module):
         logits, values = self.decoder(h.reshape(B*TT, -1))
         return logits, values.reshape(B, TT, -1)  # [B, TT, num_critics]
 
+    def forward_train_recurrent(self, x, state, resets):
+        # Stateful shared-trunk training: seed the trunk with the carried rollout state and clear it
+        # on episode resets so newlogprob reproduces the rollout logprob (PPO ratio ~ 1).
+        B, TT = x.shape[:2]
+        h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
+        h = self.network.forward_train(h.reshape(B, TT, -1), state=state, resets=resets)
+        logits, values = self.decoder(h.reshape(B*TT, -1))
+        return logits, values.reshape(B, TT, -1)  # [B, TT, num_critics]
+
 class DefaultEncoder(nn.Module):
     def __init__(self, obs_size, hidden_size=128):
         super().__init__()

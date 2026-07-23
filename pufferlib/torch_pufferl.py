@@ -16,6 +16,7 @@ from torch.distributions.utils import logits_to_probs
 
 import pufferlib
 import pufferlib.pufferl
+import pufferlib.models
 from pufferlib.muon import Muon
 from pufferlib import _C
 if _C.precision_bytes != 4:
@@ -379,7 +380,13 @@ class PuffeRL:
 
             prof.mark(1)
             if mb_critic_obs is None:
-                logits, newvalue = self.policy(mb_obs)
+                if self.rollout_state and isinstance(self.policy.network, pufferlib.models.MinGRU):
+                    copies = 2 if sym_obs_fn is not None else 1
+                    mb_state = tuple(s[:, idx].contiguous().repeat(1, copies, 1) for s in self.rollout_state)
+                    mb_resets = ter[idx].repeat(copies, 1)
+                    logits, newvalue = self.policy.forward_train_recurrent(mb_obs, mb_state, mb_resets)
+                else:
+                    logits, newvalue = self.policy(mb_obs)
             else:
                 copies = 2 if sym_obs_fn is not None else 1
                 mb_state = tuple(s[:, idx].contiguous().repeat(1, copies, 1) for s in self.rollout_state)
