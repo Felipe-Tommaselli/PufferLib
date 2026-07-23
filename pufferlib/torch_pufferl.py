@@ -184,7 +184,11 @@ class PuffeRL:
         self.timeouts = torch.zeros(horizon, total_agents, device=device)
         self.ratio = torch.ones(total_agents, horizon, device=device)
         self.state = policy.initial_state(total_agents, device=device)
+        self.symmetry_state = ()
         self.rollout_state = ()
+        self.symmetry_rollout_state = ()
+        self.symmetry_logprobs = torch.zeros(horizon, total_agents, device=device)
+        self.symmetry_action_error = torch.zeros(horizon, total_agents, device=device)
         self.last_done = torch.zeros(total_agents, device=device)
 
         self.batch_size = total_agents * horizon
@@ -243,24 +247,46 @@ class PuffeRL:
         P = Profile
         prof.mark(0)
         self.rollout_state = tuple(s.clone() for s in self.state)
+        sym_obs_fn = getattr(self, 'symmetry_obs_fn', None)
+        if sym_obs_fn is not None:
+            self.symmetry_rollout_state = tuple(s.clone() for s in self.symmetry_state)
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
 
             if self.state:
                 self.state = _reset_state(self.state, torch.as_tensor(d, device=device))
+            if sym_obs_fn is not None:
+                self.symmetry_state = _reset_state(
+                    self.symmetry_state, torch.as_tensor(d, device=device))
 
             prof.mark(1)
             with torch.no_grad():
                 if self.vec_critic_obs is None:
                     logits, value, state = self.policy.forward_eval(o_device, self.state)
+                    if sym_obs_fn is not None:
+                        sym_logits, _, sym_state = self.policy.forward_eval(
+                            sym_obs_fn(o_device), self.symmetry_state)
                 else:
                     critic_o = torch.as_tensor(self.vec_critic_obs, device=device)
                     logits, value, state = self.policy.forward_eval(o_device, critic_o, self.state)
+                    if sym_obs_fn is not None:
+                        mirror_critic = self.symmetry_critic_obs_fn(critic_o)
+                        sym_logits, _, sym_state = self.policy.forward_eval(
+                            sym_obs_fn(o_device), mirror_critic, self.symmetry_state)
                 action, logprob, _ = sample_logits(logits)
+                if sym_obs_fn is not None:
+                    mirrored_action = self.symmetry_act_fn(action)
+                    _, symmetry_logprob, _ = sample_logits(sym_logits, action=mirrored_action)
             prof.mark(2)
 
             with torch.no_grad():
                 self.state = state
+                if sym_obs_fn is not None:
+                    self.symmetry_state = sym_state
+                    self.symmetry_logprobs[t] = symmetry_logprob
+                    mirrored_mean = self.symmetry_act_fn(logits.mean)
+                    self.symmetry_action_error[t] = (
+                        sym_logits.mean - mirrored_mean).square().mean(-1).sqrt()
                 self.observations[t] = o_device
                 if self.critic_observations is not None:
                     self.critic_observations[t] = critic_o
@@ -329,6 +355,30 @@ class PuffeRL:
         ter = self.terminals.T.contiguous()
         timeouts = self.timeouts.T.contiguous()
         rew = _bootstrap_timeouts(rew, val, timeouts, config['gamma'])
+        sym_obs_fn = getattr(self, 'symmetry_obs_fn', None)
+        sgma_metrics = {}
+        if sym_obs_fn is not None:
+            sgma_logratio = self.symmetry_logprobs.T - lp
+            sgma_ratio = sgma_logratio.exp()
+            sgma_kl = (sgma_ratio - 1) - sgma_logratio
+            sgma_metrics = {
+                'sgma_pre_ratio_mean': sgma_ratio.mean().item(),
+                'sgma_pre_ratio_median': sgma_ratio.median().item(),
+                'sgma_pre_ratio_std': sgma_ratio.std().item(),
+                'sgma_pre_ratio_min': sgma_ratio.min().item(),
+                'sgma_pre_ratio_max': sgma_ratio.max().item(),
+                'sgma_pre_ratio_p05': torch.quantile(sgma_ratio, 0.05).item(),
+                'sgma_pre_ratio_p95': torch.quantile(sgma_ratio, 0.95).item(),
+                'sgma_pre_approx_kl': sgma_kl.mean().item(),
+                'sgma_pre_clipfrac': (
+                    (sgma_ratio - 1).abs() > config['clip_coef']).float().mean().item(),
+                'sgma_action_equivariance_rmse': self.symmetry_action_error.mean().item(),
+            }
+            for age in (1, 10, 50, config['horizon']):
+                if age > config['horizon']:
+                    continue
+                sgma_metrics[f'sgma_action_rmse_t{age}'] = (
+                    self.symmetry_action_error[age - 1].mean().item())
 
         P = Profile
         prof.mark(0)
@@ -360,11 +410,8 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
-            # Left-right symmetry data-augmentation (faster): append mirrored obs/actions and
-            # repeat the rollout tensors, so the loss is evaluated on both views. Gated by
-            # symmetry_obs_fn (set post-construction); a no-op with n_real==full when unset.
+            # SGMA: append mirrored trajectories and use their independently propagated memory.
             n_real = idx.shape[0]
-            sym_obs_fn = getattr(self, 'symmetry_obs_fn', None)
             if sym_obs_fn is not None:
                 mb_obs = torch.cat([mb_obs, sym_obs_fn(mb_obs)], 0)
                 mb_actions = torch.cat([mb_actions, self.symmetry_act_fn(mb_actions)], 0)
@@ -381,16 +428,22 @@ class PuffeRL:
             prof.mark(1)
             if mb_critic_obs is None:
                 if self.rollout_state and isinstance(self.policy.network, pufferlib.models.MinGRU):
-                    copies = 2 if sym_obs_fn is not None else 1
-                    mb_state = tuple(s[:, idx].contiguous().repeat(1, copies, 1) for s in self.rollout_state)
-                    mb_resets = ter[idx].repeat(copies, 1)
+                    mb_state = tuple(
+                        torch.cat([s[:, idx], sg[:, idx]], 1).contiguous()
+                        for s, sg in zip(self.rollout_state, self.symmetry_rollout_state)
+                    ) if sym_obs_fn is not None else tuple(
+                        s[:, idx].contiguous() for s in self.rollout_state)
+                    mb_resets = ter[idx].repeat(2 if sym_obs_fn is not None else 1, 1)
                     logits, newvalue = self.policy.forward_train_recurrent(mb_obs, mb_state, mb_resets)
                 else:
                     logits, newvalue = self.policy(mb_obs)
             else:
-                copies = 2 if sym_obs_fn is not None else 1
-                mb_state = tuple(s[:, idx].contiguous().repeat(1, copies, 1) for s in self.rollout_state)
-                mb_resets = ter[idx].repeat(copies, 1)
+                mb_state = tuple(
+                    torch.cat([s[:, idx], sg[:, idx]], 1).contiguous()
+                    for s, sg in zip(self.rollout_state, self.symmetry_rollout_state)
+                ) if sym_obs_fn is not None else tuple(
+                    s[:, idx].contiguous() for s in self.rollout_state)
+                mb_resets = ter[idx].repeat(2 if sym_obs_fn is not None else 1, 1)
                 logits, newvalue = self.policy.forward_train_recurrent(
                     mb_obs, mb_critic_obs, mb_state, mb_resets
                 )
@@ -407,6 +460,18 @@ class PuffeRL:
                 old_approx_kl = (-logratio).mean()
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
+                if sym_obs_fn is not None:
+                    real_logratio = logratio[:n_real]
+                    real_ratio = ratio[:n_real]
+                    real_approx_kl = ((real_ratio - 1) - real_logratio).mean()
+                    real_clipfrac = (
+                        (real_ratio - 1.0).abs() > config['clip_coef']).float().mean()
+                    mirror_logratio = logratio[n_real:]
+                    mirror_ratio = ratio[n_real:]
+                    mirror_approx_kl = (
+                        (mirror_ratio - 1) - mirror_logratio).mean()
+                    mirror_clipfrac = (
+                        (mirror_ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
             # Normalize each critic's advantage independently (over segments+time, keep group axis),
             # then sum groups into one scalar advantage for the shared policy surrogate (paper eq.).
@@ -439,6 +504,12 @@ class PuffeRL:
             losses['approx_kl'] += approx_kl
             losses['clipfrac'] += clipfrac
             losses['importance'] += ratio.mean()
+            if sym_obs_fn is not None:
+                losses['sgma_real_approx_kl'] += real_approx_kl
+                losses['sgma_real_clipfrac'] += real_clipfrac
+                losses['sgma_mirror_approx_kl'] += mirror_approx_kl
+                losses['sgma_mirror_clipfrac'] += mirror_clipfrac
+                losses['sgma_mirror_importance'] += mirror_ratio.mean()
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
@@ -456,6 +527,7 @@ class PuffeRL:
         prof.elapsed(P.TRAIN, 0, 1)
 
         losses = {k: v.item() / updates for k, v in losses.items()}
+        losses.update(sgma_metrics)
         if hasattr(self.policy, 'action_logstd'):
             losses['action_logstd_mean'] = self.policy.action_logstd.mean().item()
             losses['action_logstd_max'] = self.policy.action_logstd.max().item()
