@@ -520,7 +520,8 @@ class PuffeRL:
             losses['grad_norm'] += grad_norm
             updates += 1
             target_kl = config.get('target_kl')
-            if target_kl is not None and approx_kl.item() > target_kl:
+            stop_kl = real_approx_kl if sym_obs_fn is not None else approx_kl
+            if target_kl is not None and stop_kl.item() > target_kl:
                 break
 
         prof.mark(1)

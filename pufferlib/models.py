@@ -59,6 +59,15 @@ class Policy(nn.Module):
         logits, values = self.decoder(h.reshape(B*TT, -1))
         return logits, values.reshape(B, TT, -1)  # [B, TT, num_critics]
 
+    @property
+    def action_logstd(self):
+        return self.decoder.decoder_logstd
+
+    @torch.no_grad()
+    def clamp_logstd(self):
+        if hasattr(self.decoder, 'clamp_logstd'):
+            self.decoder.clamp_logstd()
+
 class DefaultEncoder(nn.Module):
     def __init__(self, obs_size, hidden_size=128):
         super().__init__()
@@ -90,7 +99,8 @@ class MinimalEntityEncoder(nn.Module):
         return self.encoder(cat).max(dim=1)[0]
 
 class DefaultDecoder(nn.Module):
-    def __init__(self, nvec, hidden_size=128, num_critics=1):
+    def __init__(self, nvec, hidden_size=128, num_critics=1,
+            logstd_min=-float('inf'), logstd_max=float('inf')):
         super().__init__()
         self.nvec = tuple(nvec)
         self.is_continuous = sum(nvec) == len(nvec)
@@ -99,6 +109,8 @@ class DefaultDecoder(nn.Module):
             num_atns = len(nvec)
             self.decoder_mean = nn.Linear(hidden_size, num_atns)
             self.decoder_logstd = nn.Parameter(torch.zeros(1, num_atns))
+            self.logstd_min = float(logstd_min)
+            self.logstd_max = float(logstd_max)
         else:
             self.decoder = nn.Linear(hidden_size, int(np.sum(nvec)))
 
@@ -108,7 +120,7 @@ class DefaultDecoder(nn.Module):
     def forward(self, hidden):
         if self.is_continuous:
             mean = self.decoder_mean(hidden)
-            logstd = self.decoder_logstd.expand_as(mean)
+            logstd = self.decoder_logstd.clamp(self.logstd_min, self.logstd_max).expand_as(mean)
             logits = torch.distributions.Normal(mean, torch.exp(logstd))
         else:
             logits = self.decoder(hidden)
@@ -117,6 +129,11 @@ class DefaultDecoder(nn.Module):
 
         values = self.value_function(hidden)
         return logits, values
+
+    @torch.no_grad()
+    def clamp_logstd(self):
+        if self.is_continuous:
+            self.decoder_logstd.clamp_(self.logstd_min, self.logstd_max)
 
 class MLP(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
