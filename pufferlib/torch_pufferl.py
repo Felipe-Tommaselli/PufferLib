@@ -84,6 +84,26 @@ def sample_logits(logits, action=None):
 
     return action.T, logprob.sum(0), logits_entropy
 
+def stow_hold_metrics(logits, obs, config):
+    """Zero-output prior for arm dimensions overridden by a hard stow controller.
+
+    PPO remains deliberately unchanged: this auxiliary only makes the latent command safe and
+    continuous when policy ownership resumes.
+    """
+    coef = float(config.get('stow_hold_coef', 0.0))
+    obs_index = config.get('stow_mode_obs_index')
+    action_start = config.get('stow_arm_action_start')
+    if coef <= 0.0 or obs_index is None or action_start is None:
+        zero = logits.mean.sum() * 0.0
+        return zero, zero.detach(), zero.detach()
+    stowed = obs[..., int(obs_index)] > 0.5
+    arm_mean = logits.mean.reshape(*obs.shape[:-1], -1)[..., int(action_start):]
+    if not stowed.any():
+        zero = arm_mean.sum() * 0.0
+        return zero, zero.detach(), stowed.float().mean()
+    selected = arm_mean[stowed]
+    return selected.square().mean(), selected.abs().mean().detach(), stowed.float().mean()
+
 class _CudaPtr:
     '''Wraps a raw CUDA pointer so torch.as_tensor can consume it via
     __cuda_array_interface__ without any copy or C++ torch dependency.'''
@@ -472,7 +492,6 @@ class PuffeRL:
                         (mirror_ratio - 1) - mirror_logratio).mean()
                     mirror_clipfrac = (
                         (mirror_ratio - 1.0).abs() > config['clip_coef']).float().mean()
-
             # Normalize each critic's advantage independently (over segments+time, keep group axis),
             # then sum groups into one scalar advantage for the shared policy surrogate (paper eq.).
             adv = mb_advantages
@@ -492,7 +511,11 @@ class PuffeRL:
             v_loss_groups = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean(dim=(0, 1))
 
             entropy_loss = entropy.mean()
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+            stow_hold_loss, stow_arm_mean_abs, stow_sample_fraction = stow_hold_metrics(
+                logits, mb_obs, config
+            )
+            loss = (pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+                    + float(config.get('stow_hold_coef', 0.0))*stow_hold_loss)
             val[idx] = newvalue[:n_real].detach().float()
 
             losses['policy_loss'] += pg_loss
@@ -500,6 +523,12 @@ class PuffeRL:
             for g in range(self.num_critics):
                 losses[f'value_loss_{g}'] += v_loss_groups[g]
             losses['entropy'] += entropy_loss
+            losses['stow_hold_loss'] += stow_hold_loss
+            losses['stow_hold_weighted'] += (
+                float(config.get('stow_hold_coef', 0.0))*stow_hold_loss
+            )
+            losses['stow_arm_mean_abs'] += stow_arm_mean_abs
+            losses['stow_sample_fraction'] += stow_sample_fraction
             losses['old_approx_kl'] += old_approx_kl
             losses['approx_kl'] += approx_kl
             losses['clipfrac'] += clipfrac
