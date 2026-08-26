@@ -233,8 +233,10 @@ class PuffeRL:
         self.start_time = time.time()
         self.profile = Profile(gpu=self.gpu)
         self.verbose = verbose
+        # An all-ones tilt is the stock equal-sum path: skip the broadcast multiply entirely.
         rgw = config.get('reward_group_weights')
-        if rgw is not None and self.num_critics > 1:
+        if (rgw is not None and self.num_critics > 1
+                and any(float(w) != 1.0 for w in rgw)):
             self._reward_group_weights = torch.tensor(rgw, dtype=torch.float32, device=device)
         else:
             self._reward_group_weights = None
