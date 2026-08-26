@@ -233,6 +233,11 @@ class PuffeRL:
         self.start_time = time.time()
         self.profile = Profile(gpu=self.gpu)
         self.verbose = verbose
+        rgw = config.get('reward_group_weights')
+        if rgw is not None and self.num_critics > 1:
+            self._reward_group_weights = torch.tensor(rgw, dtype=torch.float32, device=device)
+        else:
+            self._reward_group_weights = None
 
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         if verbose:
@@ -493,9 +498,11 @@ class PuffeRL:
                     mirror_clipfrac = (
                         (mirror_ratio - 1.0).abs() > config['clip_coef']).float().mean()
             # Normalize each critic's advantage independently (over segments+time, keep group axis),
-            # then sum groups into one scalar advantage for the shared policy surrogate (paper eq.).
+            # then weight and sum groups into one scalar advantage for the shared policy surrogate.
             adv = mb_advantages
             adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
+            if self._reward_group_weights is not None:
+                adv = adv * self._reward_group_weights
             adv = mb_prio * adv.sum(-1)
 
             pg_loss1 = -adv * ratio
