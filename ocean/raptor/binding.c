@@ -20,6 +20,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->reward_params.scale = dict_get(kwargs, "reward_scale")->value;
     env->reward_params.constant = dict_get(kwargs, "reward_constant")->value;
     env->reward_params.position = dict_get(kwargs, "reward_position")->value;
+    env->reward_params.position_clip = dict_get(kwargs, "reward_position_clip")->value;
     env->reward_params.orientation = dict_get(kwargs, "reward_orientation")->value;
     env->reward_params.d_action = dict_get(kwargs, "reward_d_action")->value;
 
@@ -41,6 +42,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_return", log->episode_return / n);
     dict_set(out, "episode_length", log->episode_length / n);
     dict_set(out, "position_error", log->position_error / n);
+    dict_set(out, "settle_error", log->settle_error / log->settle_n);
     dict_set(out, "d_action", log->d_action / n);
     dict_set(out, "terminated", log->terminated / n);
     dict_set(out, "n", log->n);

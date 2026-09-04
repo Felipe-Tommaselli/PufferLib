@@ -9,6 +9,8 @@ struct Log {
     float episode_return;
     float episode_length;
     float position_error;
+    float settle_error;
+    float settle_n;
     float d_action;
     float terminated;
     float n;
@@ -21,6 +23,8 @@ typedef struct {
     int episode_length;
     float position_error_sum;
     float d_action_sum;
+    float settle_sum;
+    int settle_n;
 } Agent;
 
 typedef struct RaptorEnv RaptorEnv;
@@ -49,6 +53,8 @@ static void add_log(RaptorEnv* env, Agent* agent, bool term) {
     env->log.episode_return += agent->episode_return;
     env->log.episode_length += agent->episode_length;
     env->log.position_error += agent->position_error_sum / agent->episode_length;
+    env->log.settle_error += agent->settle_sum;
+    env->log.settle_n += agent->settle_n;
     env->log.d_action += agent->d_action_sum / agent->episode_length;
     env->log.terminated += term ? 1.0f : 0.0f;
     env->log.n += 1.0f;
@@ -62,6 +68,8 @@ static void reset_agent(RaptorEnv* env, int idx) {
     agent->episode_length = 0;
     agent->position_error_sum = 0;
     agent->d_action_sum = 0;
+    agent->settle_sum = 0;
+    agent->settle_n = 0;
     reset_state(&agent->airframe, &env->init_params, &agent->state, &env->rng);
     trajectory(&env->traj, 0.0f, agent->state.target, agent->state.target_velocity);
 }
@@ -92,7 +100,12 @@ void c_step(RaptorEnv* env) {
         agent->d_action_sum += sqrtf(d_action);
         float ex = next.position[0] - next.target[0], ey = next.position[1] - next.target[1],
               ez = next.position[2] - next.target[2];
-        agent->position_error_sum += sqrtf(ex * ex + ey * ey + ez * ez);
+        float e = sqrtf(ex * ex + ey * ey + ez * ez);
+        agent->position_error_sum += e;
+        if (agent->episode_length * 2 >= env->horizon) {
+            agent->settle_sum += e;
+            agent->settle_n += 1;
+        }
 
         agent->state = next;
         agent->episode_return += r;

@@ -225,6 +225,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         return
 
     args.pop('nccl_id', None)
+    if args['load_model_path'] is not None:
+        backend.load_weights(pufferl, args['load_model_path'])
+        print(f'Loaded weights from {args["load_model_path"]}')
     model_size = pufferl.num_params()
     if verbose:
         flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))

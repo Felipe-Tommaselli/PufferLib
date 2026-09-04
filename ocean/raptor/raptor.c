@@ -12,6 +12,7 @@ static void check(const char* name, bool ok, const char* detail) {
 
 static float g_dr = 0.0f;
 static TrajParams g_traj = {0.0f, 10.0f};
+static int g_obs_clip = 1;
 
 static RaptorEnv* make_env(int num_agents, unsigned int seed) {
     RaptorEnv* env = (RaptorEnv*)calloc(1, sizeof(RaptorEnv));
@@ -22,6 +23,7 @@ static RaptorEnv* make_env(int num_agents, unsigned int seed) {
     env->term_params = TERMINATION_FOUNDATION;
     env->init_params = INIT_90_DEG;
     env->horizon = RAPTOR_HORIZON;
+    env->obs_clip = g_obs_clip;
     env->dr = g_dr;
     env->traj = g_traj;
     env->observations = (float*)calloc(num_agents * RAPTOR_OBS_DIM, sizeof(float));
@@ -270,7 +272,7 @@ static void test_policy_parity(void) {
 
 typedef struct {
     int episodes;
-    float ret, length, position_error, d_action, terminated;
+    float ret, length, position_error, settle_error, d_action, terminated;
 } Replay;
 
 static Replay run_replay(int n, int steps) {
@@ -287,8 +289,11 @@ static Replay run_replay(int n, int steps) {
             if (env->terminals[i] != 0.0f) policy_reset(&policies[i]);
     }
     float e = env->log.n > 0 ? env->log.n : 1.0f;
-    Replay r = {(int)env->log.n,          env->log.episode_return / e, env->log.episode_length / e,
-                env->log.position_error / e, env->log.d_action / e,    env->log.terminated / e};
+    Replay r = {(int)env->log.n,             env->log.episode_return / e,
+                env->log.episode_length / e, env->log.position_error / e,
+                env->log.settle_error / env->log.settle_n,
+                env->log.d_action / e,
+                env->log.terminated / e};
     free(policies);
     free_env(env);
     return r;
@@ -296,8 +301,9 @@ static Replay run_replay(int n, int steps) {
 
 static void test_base_policy_replay(void) {
     Replay r = run_replay(256, 5000);
-    printf("     episodes %d | return %.2f | length %.1f | pos err %.3f m | terminated %.1f%%\n",
-           r.episodes, r.ret, r.length, r.position_error, 100.0f * r.terminated);
+    printf("     episodes %d | return %.2f | length %.1f | pos err %.3f m | settle %.4f m | "
+           "terminated %.1f%%\n",
+           r.episodes, r.ret, r.length, r.position_error, r.settle_error, 100.0f * r.terminated);
     char buf[96];
     snprintf(buf, sizeof(buf), "return %.2f, length %.1f, terminated %.1f%%", r.ret, r.length,
              100.0f * r.terminated);
@@ -387,6 +393,8 @@ int main(int argc, char** argv) {
             policy_load(argv[++i]);
         } else if (strcmp(argv[i], "--dr") == 0 && i + 1 < argc) {
             g_dr = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--obs-clip") == 0 && i + 1 < argc) {
+            g_obs_clip = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fig8") == 0 && i + 1 < argc) {
             g_traj.amplitude = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--fig8-period") == 0 && i + 1 < argc) {
@@ -419,8 +427,9 @@ int main(int argc, char** argv) {
         Replay r = run_replay(mode_args[0] ? atoi(mode_args[0]) : 256,
                               mode_args[1] ? atoi(mode_args[1]) : 5000);
         printf("{\"episodes\": %d, \"return\": %.6f, \"length\": %.4f, \"position_error\": %.6f, "
-               "\"d_action\": %.6f, \"terminated\": %.6f}\n",
-               r.episodes, r.ret, r.length, r.position_error, r.d_action, r.terminated);
+               "\"settle_error\": %.6f, \"d_action\": %.6f, \"terminated\": %.6f}\n",
+               r.episodes, r.ret, r.length, r.position_error, r.settle_error, r.d_action,
+               r.terminated);
         return 0;
     }
     if (mode && strcmp(mode, "--dump") == 0) {

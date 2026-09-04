@@ -64,7 +64,7 @@ typedef struct {
 } InitParams;
 
 static const RewardParams REWARD_FOUNDATION = {
-    1.0f, 1.5f, -100.0f, 1.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false,
+    1.0f, 1.5f, -100.0f, 1.0f, 0.2f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false,
 };
 
 static const TerminationParams TERMINATION_FOUNDATION = {true, 1.0f, 2.0f, 35.0f};

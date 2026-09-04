@@ -103,6 +103,69 @@ static int parity() {
     return worst >= 1e-4f;
 }
 
+// The trainer acts through net.forward one step at a time; forward_train only runs in BPTT.
+static int parity_rollout() {
+    std::vector<float> pw = read_file("../../../../artifacts/raptor/base_policy.bin", 0);
+    std::vector<float> fin = read_file("../../../../artifacts/raptor/fixture_in.bin", 8);
+    std::vector<float> fout = read_file("../../../../artifacts/raptor/fixture_out.bin", 8);
+    int TT = 500, B = 2;
+
+    Encoder enc = {.in_dim = OBS, .out_dim = HID};
+    create_raptor_encoder(&enc);
+    Network net = {.hidden = HID, .num_layers = 1, .horizon = TT};
+    create_raptor_network(&net);
+    void* ew = enc.create_weights(&enc);
+    void* nw = net.create_weights(&net);
+
+    Allocator params = {}, acts = {};
+    enc.reg_params(ew, &params);
+    net.reg_params(nw, &params);
+    void* enc_a = calloc(1, enc.activation_size);
+    void* net_a = calloc(1, net.activation_size);
+    enc.reg_rollout(ew, enc_a, &acts, B);
+    net.reg_rollout(nw, net_a, &acts, B);
+    PrecisionTensor state = {.shape = {B, HID}};
+    alloc_register(&acts, &state);
+    alloc_create(&params);
+    alloc_create(&acts);
+
+    RaptorEncWeights* e = (RaptorEncWeights*)ew;
+    RaptorGRUWeights* g = (RaptorGRUWeights*)nw;
+    upload(&e->w, pw.data() + 0);
+    upload(&e->b, pw.data() + 352);
+    upload(&g->wi, pw.data() + 368);
+    upload(&g->wh, pw.data() + 1136);
+    upload(&g->bi, pw.data() + 1904);
+    upload(&g->bh, pw.data() + 1952);
+    upload(&g->h0, pw.data() + 2000);
+
+    net.reset(nw, state, nullptr, 0, B, 0);
+
+    PrecisionTensor x = {.shape = {B, OBS}};
+    cudaMalloc(&x.data, (size_t)B * OBS * sizeof(float));
+    std::vector<float> hid(B * HID);
+    float worst = 0;
+    for (int t = 0; t < TT; t++) {
+        cudaMemcpy(x.data, fin.data() + (size_t)t * B * OBS, B * OBS * sizeof(float),
+                   cudaMemcpyHostToDevice);
+        PrecisionTensor h = enc.forward(ew, enc_a, x, 0);
+        PrecisionTensor out = net.forward(nw, h, state, net_a, 0);
+        cudaDeviceSynchronize();
+        cudaMemcpy(hid.data(), out.data, hid.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        for (int b = 0; b < B; b++) {
+            for (int k = 0; k < ACT; k++) {
+                float v = pw[2080 + k];
+                for (int j = 0; j < HID; j++) v += pw[2016 + k * HID + j] * hid[b * HID + j];
+                float err = fabsf(v - fout[(t * B + b) * ACT + k]);
+                if (err > worst) worst = err;
+            }
+        }
+    }
+    printf("max|CUDA rollout - shipped fixture| = %.3e over %d steps x %d agents\n", worst, TT, B);
+    printf("%s\n", worst < 1e-4f ? "PASS" : "FAIL");
+    return worst >= 1e-4f;
+}
+
 // L = sum(mask * gru_out); analytic gradients must match central differences.
 static int gradcheck(bool with_dones) {
     int TT = 8, B = 4;
@@ -424,7 +487,8 @@ static int decoder_grad() {
 
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "--layout") == 0) return layout(true);
-    int fails = parity() + gradcheck(false) + gradcheck(true) + layout() + optim_placement() + decoder_grad();
+    int fails = parity() + parity_rollout() + gradcheck(false) + gradcheck(true) + layout()
+        + optim_placement() + decoder_grad();
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;
 }
