@@ -151,6 +151,21 @@ void rollouts(pybind11::object pufferl_obj) {
         }
     }
 
+    // seed outside the rollout cudagraph so a captured step never replays a reset
+    if (pufferl.epoch == 0) {
+        for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+            pufferl.policy.network.reset(pufferl.weights.network, pufferl.buffer_states[i],
+                nullptr, 0, pufferl.buffer_states[i].shape[1], pufferl.default_stream);
+        }
+        for (int b = 0; b < pufferl.num_frozen_banks; b++) {
+            WeightBank& fb = pufferl.frozen_banks[b];
+            for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+                fb.policy.network.reset(fb.weights.network, fb.buffer_states[i], nullptr, 0,
+                    fb.buffer_states[i].shape[1], pufferl.default_stream);
+            }
+        }
+    }
+
     static_vec_omp_step(pufferl.vec);
     float sec = (float)(wall_clock() - t0);
     pufferl.profile.accum[PROF_ROLLOUT] += sec * 1000.0f;  // store as ms

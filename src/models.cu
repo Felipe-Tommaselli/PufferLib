@@ -21,6 +21,8 @@ typedef void* (*create_weights_fn)(void* self);
 typedef void  (*free_weights_fn)(void* weights);
 typedef void  (*free_activations_fn)(void* activations);
 typedef PrecisionTensor (*forward_fn)(void* weights, void* activations, PrecisionTensor input, cudaStream_t stream);
+typedef PrecisionTensor (*decoder_forward_fn)(void* weights, void* activations,
+    PrecisionTensor input, PrecisionTensor obs, cudaStream_t stream);
 typedef void (*encoder_backward_fn)(void* weights, void* activations,
     PrecisionTensor grad, cudaStream_t stream);
 typedef PrecisionTensor (*decoder_backward_fn)(void* weights, void* activations,
@@ -28,9 +30,11 @@ typedef PrecisionTensor (*decoder_backward_fn)(void* weights, void* activations,
 typedef PrecisionTensor (*network_forward_fn)(void* weights, PrecisionTensor x,
     PrecisionTensor state, void* activations, cudaStream_t stream);
 typedef PrecisionTensor (*network_forward_train_fn)(void* weights, PrecisionTensor x,
-    PrecisionTensor state, void* activations, cudaStream_t stream);
+    PrecisionTensor state, PrecisionTensor dones, void* activations, cudaStream_t stream);
 typedef PrecisionTensor (*network_backward_fn)(void* weights,
     PrecisionTensor grad, void* activations, cudaStream_t stream);
+typedef void (*network_reset_fn)(void* weights, PrecisionTensor state, const float* dones,
+    int row_off, int rows, cudaStream_t stream);
 
 struct Encoder {
     forward_fn forward;
@@ -47,7 +51,7 @@ struct Encoder {
 };
 
 struct Decoder {
-    forward_fn forward;
+    decoder_forward_fn forward;
     decoder_backward_fn backward;
     init_weights_fn init_weights;
     reg_params_fn reg_params;
@@ -62,6 +66,7 @@ struct Decoder {
 };
 
 struct Network {
+    network_reset_fn reset;  // restore rows to the initial state where dones is set
     network_forward_fn forward;
     network_forward_train_fn forward_train;
     network_backward_fn backward;
@@ -73,6 +78,7 @@ struct Network {
     free_weights_fn free_weights;
     free_activations_fn free_activations;
     int hidden, num_layers, horizon;
+    size_t activation_size;  // sizeof the impl's activations struct
 };
 
 struct EncoderWeights {
@@ -483,7 +489,9 @@ struct DecoderActivations {
     PrecisionTensor out, grad_out, saved_input, grad_input, wgrad_scratch, logstd_scratch;
 };
 
-static PrecisionTensor decoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
+static PrecisionTensor decoder_forward(void* w, void* activations, PrecisionTensor input,
+        PrecisionTensor obs, cudaStream_t stream) {
+    (void)obs;
     DecoderWeights* dw = (DecoderWeights*)w;
     DecoderActivations* a = (DecoderActivations*)activations;
     if (a->saved_input.data) {
@@ -701,6 +709,12 @@ static void mingru_free_activations(void* activations) {
     free(a);
 }
 
+// stock behavior: recurrent state is never reset at episode boundaries
+static void mingru_reset(void* w, PrecisionTensor state, const float* dones, int row_off,
+        int rows, cudaStream_t stream) {
+    (void)w; (void)state; (void)dones; (void)row_off; (void)rows; (void)stream;
+}
+
 static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTensor state,
         void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
@@ -720,7 +734,8 @@ static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTenso
 }
 
 static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, PrecisionTensor state,
-        void* activations, cudaStream_t stream) {
+        PrecisionTensor dones, void* activations, cudaStream_t stream) {
+    (void)dones;
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = x.shape[0];
@@ -784,15 +799,18 @@ PrecisionTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& a
         PrecisionTensor obs, PrecisionTensor state, cudaStream_t stream) {
     PrecisionTensor enc_out = p->encoder.forward(w.encoder, activations.encoder, obs, stream);
     PrecisionTensor h = p->network.forward(w.network, enc_out, state, activations.network, stream);
-    return p->decoder.forward(w.decoder, activations.decoder, h, stream);
+    return p->decoder.forward(w.decoder, activations.decoder, h, obs, stream);
 }
 
 PrecisionTensor policy_forward_train(Policy* p, PolicyWeights& w, PolicyActivations& activations,
-        PrecisionTensor x, PrecisionTensor state, cudaStream_t stream) {
+        PrecisionTensor x, PrecisionTensor state, PrecisionTensor dones, cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
-    PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, *puf_squeeze(&x, 0), stream);
-    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, activations.network, stream);
-    PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
+    PrecisionTensor obs = *puf_squeeze(&x, 0);
+    PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, obs, stream);
+    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, dones,
+        activations.network, stream);
+    PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder,
+        *puf_squeeze(&h, 0), obs, stream);
     return *puf_unsqueeze(&dec_out, 0, B, TT);
 }
 
@@ -810,7 +828,7 @@ PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
     PolicyActivations a;
     a.encoder = calloc(1, p->encoder.activation_size);
     a.decoder = calloc(1, p->decoder.activation_size);
-    a.network = calloc(1, sizeof(MinGRUActivations));
+    a.network = calloc(1, p->network.activation_size);
     p->encoder.reg_train(w.encoder, a.encoder, acts, grads, B_TT);
     p->decoder.reg_train(w.decoder, a.decoder, acts, grads, B_TT);
     p->network.reg_train(w.network, a.network, acts, grads, B_TT);
@@ -821,7 +839,7 @@ PolicyActivations policy_reg_rollout(Policy* p, PolicyWeights& w, Allocator* act
     PolicyActivations a;
     a.encoder = calloc(1, p->encoder.activation_size);
     a.decoder = calloc(1, p->decoder.activation_size);
-    a.network = calloc(1, sizeof(MinGRUActivations));
+    a.network = calloc(1, p->network.activation_size);
     p->encoder.reg_rollout(w.encoder, a.encoder, acts, B_inf);
     p->decoder.reg_rollout(w.decoder, a.decoder, acts, B_inf);
     p->network.reg_rollout(w.network, a.network, acts, B_inf);

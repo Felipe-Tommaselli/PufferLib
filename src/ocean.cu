@@ -3,6 +3,7 @@
 
 #include "cudnn_conv2d.cu"
 #include "nethack.cu"
+#include "raptor_net.cu"
 
 // ---- NMMO3 constants ----
 
@@ -589,9 +590,16 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
         };
     } else if (env_name == "nethack") {
         create_nethack_encoder(enc);
+    } else if (env_name == "raptor") {
+        create_raptor_encoder(enc);
     }
 }
 
 static void create_custom_decoder(const std::string& env_name, Decoder* dec) {
     if (env_name == "nethack") create_nethack_decoder(dec);
+    if (env_name == "raptor") create_raptor_decoder(dec);
+}
+
+static void create_custom_network(const std::string& env_name, Network* net) {
+    if (env_name == "raptor") create_raptor_network(net);
 }

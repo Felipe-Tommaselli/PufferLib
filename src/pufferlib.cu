@@ -58,12 +58,13 @@ struct RolloutBuf {
     PrecisionTensor ratio;
     PrecisionTensor importance;
     PrecisionTensor action_mask;   // (horizon, agents, mask_size); .data=nullptr when env opts out
+    PrecisionTensor epoch_state;   // (agents, layers*hidden); state each segment starts from
 };
 
 // Buffers are initialized as raw structs with only shape information. alloc_register
 // stores the shape and data pointer. Memory is only allocated after all buffers are registered.
 void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, int input_size,
-        int num_atns, int mask_size) {
+        int num_atns, int mask_size, int state_size) {
     bufs = (RolloutBuf){
         .observations = {.shape = {T, B, input_size}},
         .actions      = {.shape = {T, B, num_atns}},
@@ -74,6 +75,7 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, 
         .ratio        = {.shape = {T, B}},
         .importance   = {.shape = {T, B}},
         .action_mask  = {},
+        .epoch_state  = {.shape = {B, state_size}},
     };
     alloc_register(alloc, &bufs.observations);
     alloc_register(alloc, &bufs.actions);
@@ -83,6 +85,7 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, 
     alloc_register(alloc, &bufs.terminals);
     alloc_register(alloc, &bufs.ratio);
     alloc_register(alloc, &bufs.importance);
+    alloc_register(alloc, &bufs.epoch_state);
     if (mask_size > 0) {
         bufs.action_mask = {.shape = {T, B, mask_size}};
         alloc_register(alloc, &bufs.action_mask);
@@ -103,6 +106,7 @@ struct TrainGraph {
     PrecisionTensor mb_ratio;
     PrecisionTensor mb_newvalue;
     PrecisionTensor mb_prio;        // (B,)
+    PrecisionTensor mb_terminals;   // (B, T)
     PrecisionTensor mb_action_mask; // (B, T, mask_size); .data=nullptr when disabled
 };
 
@@ -119,6 +123,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
         .mb_ratio =         {.shape = {B, T}},
         .mb_newvalue =      {.shape = {B, T}},
         .mb_prio =          {.shape = {B}},
+        .mb_terminals =     {.shape = {B, T}},
         .mb_action_mask =   {},
     };
     alloc_register(alloc, &bufs.mb_obs);
@@ -131,6 +136,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
     alloc_register(alloc, &bufs.mb_returns);
     alloc_register(alloc, &bufs.mb_ratio);
     alloc_register(alloc, &bufs.mb_newvalue);
+    alloc_register(alloc, &bufs.mb_terminals);
     if (mask_size > 0) {
         bufs.mb_action_mask = {.shape = {B, T, mask_size}};
         alloc_register(alloc, &bufs.mb_action_mask);
@@ -624,6 +630,15 @@ __global__ void sample_logits(
     rng_states[idx] = state;
 }
 
+// snapshot a bank's rollout state rows into the global (agents, layers*hidden) epoch buffer
+__global__ void copy_state_rows(precision_t* dst, const precision_t* src, int rows, int H,
+        int L, int dst_off) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * H * L) return;
+    int l = i / (rows * H), rem = i % (rows * H);
+    dst[(long)(dst_off + rem / H) * (L * H) + l * H + rem % H] = src[i];
+}
+
 // Single step rollout forward pass. Called by each environment worker in their
 // own buffer thread. This operation is cudagraphed.
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
@@ -720,6 +735,18 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         if (rollouts.action_mask.data != nullptr) {
             mask_b = puf_slice(rollouts.action_mask, t, sub_start, bank_size);
             mask_stride_b = mask_stride;
+        }
+
+        // env.terminals describes the reset that produced this step's observation, so the
+        // state must be reset before it is either snapshotted or consumed by the forward
+        p_bank->network.reset(w_bank->network, *s_bank, env.terminals.data + sub_start, 0,
+            bank_size, stream);
+        if (t == 0) {
+            int H = p_bank->network.hidden, L = p_bank->network.num_layers;
+            int sn = bank_size * H * L;
+            copy_state_rows<<<grid_size(sn), BLOCK_SIZE, 0, stream>>>(
+                rollouts.epoch_state.data, (precision_t*)s_bank->data, bank_size, H, L,
+                sub_start);
         }
 
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
@@ -1535,6 +1562,17 @@ __global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
                        (char*)graph.mb_action_mask.data, src_row, mb, mask_row_bytes);
         }
         break;
+    case 6:
+        copy_bytes((const char*)rollouts.terminals.data, (char*)graph.mb_terminals.data,
+                   src_row, mb, horizon * sizeof(precision_t));
+        break;
+    case 7: {
+        int L = graph.mb_state.shape[0], B = graph.mb_state.shape[1], H = graph.mb_state.shape[2];
+        const precision_t* src = rollouts.epoch_state.data + (long)src_row * L * H;
+        for (int i = threadIdx.x; i < L * H; i += blockDim.x)
+            graph.mb_state.data[(long)(i / H) * B * H + (long)mb * H + i % H] = src[i];
+        break;
+    }
     }
 }
 
@@ -1650,16 +1688,21 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        if (hypers.reset_state) puf_zero(&graph.mb_state, train_stream);
         {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;
+            // epoch_state is (agents, state) already - no time axis, so it is never
+            // transposed into train layout and must come from the untransposed buffer
+            sel_src.epoch_state = src.epoch_state;
+
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
-            int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+            int channels = 8;
             select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, train_stream>>>(
                 sel_src, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
         }
+        // opt-in: envs that reset the recurrent state themselves keep the captured one
+        if (hypers.reset_state) puf_zero(&graph.mb_state, train_stream);
         profile_end(hypers.profile);
 
         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
@@ -1676,7 +1719,8 @@ void train_impl(PuffeRL& pufferl) {
             cudaStream_t stream = train_stream;
             PrecisionTensor obs_puf = graph.mb_obs;
             PrecisionTensor state_puf = graph.mb_state;
-            PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
+            PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights,
+                pufferl.train_activations, obs_puf, state_puf, graph.mb_terminals, stream);
             DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
             PrecisionTensor p_logstd;
             if (dw_train->continuous) {
@@ -1787,6 +1831,7 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
     };
     create_custom_decoder(env_name, &decoder);
     Network network = {
+        .reset = mingru_reset,
         .forward = mingru_forward,
         .forward_train = mingru_forward_train,
         .backward = mingru_backward,
@@ -1798,7 +1843,9 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
         .free_weights = mingru_free_weights,
         .free_activations = mingru_free_activations,
         .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+        .activation_size = sizeof(MinGRUActivations),
     };
+    create_custom_network(env_name, &network);
     return Policy{
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
@@ -1841,12 +1888,14 @@ static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl,
     alloc_create(params);
     alloc_create(acts);
 
-    bank->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
+    long pspan = params->total_bytes / sizeof(precision_t);
+    bank->param_puf = {.data = (precision_t*)params->mem, .shape = {pspan}};
     if (USE_BF16) {
-        bank->master_weights = {.shape = {params->total_elems}};
-        cudaMalloc(&bank->master_weights.data, params->total_elems * sizeof(float));
+        bank->master_weights = {.shape = {pspan}};
+        cudaMalloc(&bank->master_weights.data, pspan * sizeof(float));
+        cudaMemset(bank->master_weights.data, 0, pspan * sizeof(float));
     } else {
-        bank->master_weights = {.data = (float*)bank->param_puf.data, .shape = {params->total_elems}};
+        bank->master_weights = {.data = (float*)bank->param_puf.data, .shape = {pspan}};
     }
 }
 
@@ -2082,12 +2131,13 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     }
     int mask_size = pufferl->vec->action_mask_size;
     register_rollout_buffers(pufferl->rollouts,
-        acts, horizon, total_agents, input_size, num_action_heads, mask_size);
+        acts, horizon, total_agents, input_size, num_action_heads, mask_size,
+        num_layers * hidden_size);
     register_train_buffers(pufferl->train_buf,
         acts, minibatch_segments, horizon, input_size,
         hidden_size, num_action_heads, num_layers, mask_size);
     register_rollout_buffers(pufferl->train_rollouts,
-        acts, total_agents, horizon, input_size, num_action_heads, mask_size);
+        acts, total_agents, horizon, input_size, num_action_heads, mask_size, 0);
     register_ppo_buffers(pufferl->ppo_bufs_puf,
         acts, minibatch_segments, hypers.horizon, decoder_output_size, is_continuous);
     register_prio_buffers(pufferl->prio_bufs,
@@ -2121,15 +2171,19 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         return nullptr;
     }
 
-    pufferl->grad_puf = {.data = (precision_t*)grads->mem, .shape = {grads->total_elems}};
-    pufferl->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
+    pufferl->grad_puf = {.data = (precision_t*)grads->mem,
+        .shape = {(long)(grads->total_bytes / sizeof(precision_t))}};
+    long pspan = params->total_bytes / sizeof(precision_t);
+    pufferl->param_puf = {.data = (precision_t*)params->mem, .shape = {pspan}};
+    assert(numel(pufferl->grad_puf.shape) == pspan
+        && "gradient and parameter flat spans must match for positional optimizer updates");
 
     ulong init_seed = hypers.seed;
     policy_init_weights(&pufferl->policy, pufferl->weights, &init_seed, pufferl->default_stream);
-    pufferl->master_weights = {.data = (float*)pufferl->param_puf.data, .shape = {params->total_elems}};
+    pufferl->master_weights = {.data = (float*)pufferl->param_puf.data, .shape = {pspan}};
     if (USE_BF16) {
-        pufferl->master_weights = {.shape = {params->total_elems}};
-        cudaMalloc(&pufferl->master_weights.data, params->total_elems * sizeof(float));
+        pufferl->master_weights = {.shape = {pspan}};
+        cudaMalloc(&pufferl->master_weights.data, pspan * sizeof(float));
         int n = numel(pufferl->param_puf.shape);
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
             pufferl->master_weights.data, pufferl->param_puf.data, n);

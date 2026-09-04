@@ -174,3 +174,4 @@ resources/drive/binaries/*
 
 vendor/nle/
 vendor/fast-nle/
+ocean/raptor/net_test

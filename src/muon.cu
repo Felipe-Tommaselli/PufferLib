@@ -113,7 +113,8 @@ void muon_init(Muon* m, Allocator* param_alloc, double lr_val,
     m->nccl_comm = nullptr;
     m->world_size = 1;
     m->max_M = 0; m->max_N = 0;
-    long n = param_alloc->total_elems;
+    // entries are 16-byte aligned, so the flat span exceeds the sum of tensor sizes
+    long n = param_alloc->total_bytes / sizeof(precision_t);
     m->lr_puf =         {.shape = {1}};
     m->lr_derived_puf = {.shape = {2}};
     m->mb_puf =         {.shape = {n}};
@@ -175,9 +176,10 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
     muon_nesterov<<<grid_size(numel(m->mb_puf.shape)), BLOCK_SIZE, 0, stream>>>(
         m->mb_puf.data, grads.data, (float)m->momentum, numel(m->mb_puf.shape));
 
-    long offset = 0;
+    // offsets come from the pointer the allocator assigned; entries are 16-byte aligned
     for (int _i = 0; _i < m->param_alloc->num_regs; _i++) {
         AllocEntry& e = m->param_alloc->regs[_i];
+        long offset = (precision_t*)(*e.data_ptr) - (precision_t*)m->param_alloc->mem;
         precision_t* gc_ptr = grads.data + offset;
         float* wb_ptr = weights.data + offset;
         long ne = numel(e.shape);
@@ -222,6 +224,5 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
 
         muon_weight_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
             wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)ne);
-        offset += ne;
     }
 }
