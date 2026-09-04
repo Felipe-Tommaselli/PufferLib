@@ -14,7 +14,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->obs_clip = (int)dict_get(kwargs, "obs_clip")->value;
     env->dr = dict_get(kwargs, "dr")->value;
 
-    env->airframe = ((int)dict_get(kwargs, "airframe")->value == 1) ? AIRFRAME_CRAZYFLIE : AIRFRAME_X500;
+    env->airframe = AIRFRAMES[(int)dict_get(kwargs, "airframe")->value];
 
     env->reward_params = REWARD_FOUNDATION;
     env->reward_params.scale = dict_get(kwargs, "reward_scale")->value;

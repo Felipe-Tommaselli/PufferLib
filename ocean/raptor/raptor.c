@@ -17,7 +17,7 @@ static RaptorEnv* make_env(int num_agents, unsigned int seed) {
     RaptorEnv* env = (RaptorEnv*)calloc(1, sizeof(RaptorEnv));
     env->num_agents = num_agents;
     env->rng = seed;
-    env->airframe = AIRFRAME_X500;
+    env->airframe = AIRFRAME_IMAV;
     env->reward_params = REWARD_FOUNDATION;
     env->term_params = TERMINATION_FOUNDATION;
     env->init_params = INIT_90_DEG;
@@ -42,7 +42,7 @@ static void free_env(RaptorEnv* env) {
 }
 
 static void test_inertia(void) {
-    const Airframe* p = &AIRFRAME_X500;
+    const Airframe* p = &AIRFRAME_IMAV;
     float worst = 0;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++) {
@@ -61,9 +61,9 @@ static void test_hover_equilibrium(void) {
     RaptorEnv* env = make_env(1, 1);
     Agent* agent = &env->agents[0];
     memset(&agent->state, 0, sizeof(State));
-    agent->airframe = AIRFRAME_X500;
+    agent->airframe = AIRFRAME_IMAV;
     agent->state.orientation[0] = 1;
-    float hover = AIRFRAME_X500.hovering_throttle_relative;
+    float hover = AIRFRAME_IMAV.hovering_throttle_relative;
     for (int i = 0; i < 4; i++) {
         agent->state.rpm[i] = hover;
         agent->state.last_action[i] = 2 * hover - 1;
@@ -85,7 +85,7 @@ static void test_hover_equilibrium(void) {
 }
 
 static void test_motor_step_response(void) {
-    Airframe p = AIRFRAME_X500;
+    Airframe p = AIRFRAME_IMAV;
     State s;
     memset(&s, 0, sizeof(State));
     s.orientation[0] = 1;
@@ -235,7 +235,7 @@ static void test_throughput(void) {
 }
 
 static void test_yaw_sign(void) {
-    Airframe p = AIRFRAME_X500;
+    Airframe p = AIRFRAME_IMAV;
     State s;
     memset(&s, 0, sizeof(State));
     s.orientation[0] = 1;
