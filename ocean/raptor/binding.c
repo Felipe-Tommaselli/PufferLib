@@ -42,7 +42,8 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_return", log->episode_return / n);
     dict_set(out, "episode_length", log->episode_length / n);
     dict_set(out, "position_error", log->position_error / n);
-    dict_set(out, "settle_error", log->settle_error / log->settle_n);
+    dict_set(out, "settle_error", log->settle_error / (log->settle_n > 0.0f ? log->settle_n : 1.0f));
+    dict_set(out, "settle_n", log->settle_n / n);
     dict_set(out, "d_action", log->d_action / n);
     dict_set(out, "terminated", log->terminated / n);
     dict_set(out, "n", log->n);

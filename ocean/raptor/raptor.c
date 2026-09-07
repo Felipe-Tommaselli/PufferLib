@@ -272,7 +272,7 @@ static void test_policy_parity(void) {
 
 typedef struct {
     int episodes;
-    float ret, length, position_error, settle_error, d_action, terminated;
+    float ret, length, position_error, settle_error, settle_n, d_action, terminated;
 } Replay;
 
 static Replay run_replay(int n, int steps) {
@@ -291,7 +291,8 @@ static Replay run_replay(int n, int steps) {
     float e = env->log.n > 0 ? env->log.n : 1.0f;
     Replay r = {(int)env->log.n,             env->log.episode_return / e,
                 env->log.episode_length / e, env->log.position_error / e,
-                env->log.settle_error / env->log.settle_n,
+                env->log.settle_error / (env->log.settle_n > 0 ? env->log.settle_n : 1.0f),
+                env->log.settle_n,
                 env->log.d_action / e,
                 env->log.terminated / e};
     free(policies);
@@ -427,9 +428,9 @@ int main(int argc, char** argv) {
         Replay r = run_replay(mode_args[0] ? atoi(mode_args[0]) : 256,
                               mode_args[1] ? atoi(mode_args[1]) : 5000);
         printf("{\"episodes\": %d, \"return\": %.6f, \"length\": %.4f, \"position_error\": %.6f, "
-               "\"settle_error\": %.6f, \"d_action\": %.6f, \"terminated\": %.6f}\n",
-               r.episodes, r.ret, r.length, r.position_error, r.settle_error, r.d_action,
-               r.terminated);
+               "\"settle_error\": %.6f, \"settle_n\": %.0f, \"d_action\": %.6f, \"terminated\": %.6f}\n",
+               r.episodes, r.ret, r.length, r.position_error, r.settle_error, r.settle_n,
+               r.d_action, r.terminated);
         return 0;
     }
     if (mode && strcmp(mode, "--dump") == 0) {

@@ -248,12 +248,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     model_path = ''
     flat_logs = {}
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
-    eval_epochs = train_epochs // 2
-    for epoch in range(train_epochs + eval_epochs):
+    for epoch in range(train_epochs):
         backend.rollouts(pufferl)
-
-        if epoch < train_epochs:
-            backend.train(pufferl)
+        backend.train(pufferl)
 
         # In match-sweep mode we need the final checkpoint to feed into match().
         is_final = epoch == train_epochs - 1
@@ -264,33 +261,25 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
 
-        # Rate limit, but always log for eval to maintain determinism
-        if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
+        if time.time() < pufferl.last_log_time + 0.6 and not is_final:
             continue
 
-        logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
-        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
-
-        if epoch < train_epochs:
-            selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
+        flat_logs = {**flat_logs, **dict(unroll_nested_dict(backend.log(pufferl)))}
+        selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
 
         if verbose:
             print_dashboard(args, model_size, flat_logs)
 
-        if target_key not in flat_logs:
-            continue
-
         if args['wandb']:
             wandb.log(flat_logs, step=flat_logs['agent_steps'])
 
-        if epoch < train_epochs:
-            all_logs.append(flat_logs)
+        if target_key not in flat_logs:
+            continue
 
-            if (sweep_obj is not None
-                    and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
-                    sweep_obj.early_stop(logs, target_key)):
-                break
-        elif flat_logs['env/n'] > args['eval_episodes']:
+        all_logs.append(flat_logs)
+        if (sweep_obj is not None
+                and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
+                sweep_obj.early_stop(flat_logs, target_key)):
             break
 
 
