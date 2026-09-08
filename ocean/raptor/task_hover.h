@@ -7,10 +7,16 @@ static void observe(const State* s, float* obs, bool clip) {
     for (int i = 0; i < 3; i++) {
         pos[i] = s->position[i] - s->target[i];
         vel[i] = s->linear_velocity[i] - s->target_velocity[i];
-        if (clip) {
-            pos[i] = clampf(pos[i], -0.2f, 0.2f);
-            vel[i] = clampf(vel[i], -1.0f, 1.0f);
-        }
+    }
+    float c = cosf(s->target_yaw), sn = sinf(s->target_yaw);
+    float x = pos[0], vx = vel[0];
+    pos[0] = c * x + sn * pos[1];
+    pos[1] = -sn * x + c * pos[1];
+    vel[0] = c * vx + sn * vel[1];
+    vel[1] = -sn * vx + c * vel[1];
+    for (int i = 0; i < 3 && clip; i++) {
+        pos[i] = clampf(pos[i], -0.1f, 0.1f);
+        vel[i] = clampf(vel[i], -1.0f, 1.0f);
     }
     obs[0] = pos[0];
     obs[1] = pos[1];
@@ -24,6 +30,11 @@ static void observe(const State* s, float* obs, bool clip) {
     obs[9] = 2 * q[1] * q[3] - 2 * q[0] * q[2];
     obs[10] = 2 * q[2] * q[3] + 2 * q[0] * q[1];
     obs[11] = 1 - 2 * q[1] * q[1] - 2 * q[2] * q[2];
+    for (int i = 0; i < 3; i++) {
+        float row0 = obs[3 + i], row1 = obs[6 + i];
+        obs[3 + i] = c * row0 + sn * row1;
+        obs[6 + i] = -sn * row0 + c * row1;
+    }
     obs[12] = vel[0];
     obs[13] = vel[1];
     obs[14] = vel[2];
@@ -54,7 +65,9 @@ static float reward(const Airframe* p, const RewardParams* r, const State* s, co
     float position_cost = sqrtf(px * px + py * py + pz * pz);
     if (r->position_clip > 0 && position_cost > r->position_clip) position_cost = r->position_clip;
 
-    float orientation_cost = 2 * acosf(clampf(1 - fabsf(s->orientation[3]), -1.0f, 1.0f));
+    float relative_z = cosf(0.5f * s->target_yaw) * s->orientation[3] -
+                       sinf(0.5f * s->target_yaw) * s->orientation[0];
+    float orientation_cost = 2 * acosf(clampf(1 - fabsf(relative_z), -1.0f, 1.0f));
 
     float vx = s->linear_velocity[0] - s->target_velocity[0],
           vy = s->linear_velocity[1] - s->target_velocity[1],
@@ -100,6 +113,7 @@ static void reset_state(const Airframe* p, const InitParams* in, State* s, unsig
         s->angular_velocity[i] = guidance ? 0.0f : rnd_uniform(rng, -in->max_angular_velocity, in->max_angular_velocity);
     }
     for (int i = 0; i < 3; i++) s->target[i] = s->target_velocity[i] = 0.0f;
+    s->target_yaw = 0;
     if (in->max_angle > 0 && !guidance) {
         float u = rnd_uniform(rng, 0.0f, 1.0f);
         float v = rnd_uniform(rng, 0.0f, 1.0f);

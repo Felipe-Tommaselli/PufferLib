@@ -125,6 +125,8 @@ static int parity_rollout() {
     enc.reg_rollout(ew, enc_a, &acts, B);
     net.reg_rollout(nw, net_a, &acts, B);
     PrecisionTensor state = {.shape = {B, HID}};
+    PrecisionTensor bootstrap_state = {.shape = {B, HID}};
+    alloc_register(&acts, &bootstrap_state);
     alloc_register(&acts, &state);
     alloc_create(&params);
     alloc_create(&acts);
@@ -143,25 +145,33 @@ static int parity_rollout() {
 
     PrecisionTensor x = {.shape = {B, OBS}};
     cudaMalloc(&x.data, (size_t)B * OBS * sizeof(float));
-    std::vector<float> hid(B * HID);
+    std::vector<float> hid(B * HID), bootstrap(B * HID);
     float worst = 0;
     for (int t = 0; t < TT; t++) {
-        cudaMemcpy(x.data, fin.data() + (size_t)t * B * OBS, B * OBS * sizeof(float),
+        if (t == TT / 2) net.reset(nw, state, nullptr, 0, B, 0);
+        int fixture_t = t % (TT / 2);
+        cudaMemcpy(x.data, fin.data() + (size_t)fixture_t * B * OBS, B * OBS * sizeof(float),
                    cudaMemcpyHostToDevice);
         PrecisionTensor h = enc.forward(ew, enc_a, x, 0);
+        puf_copy(&bootstrap_state, &state, 0);
+        PrecisionTensor probe = net.forward(nw, h, bootstrap_state, net_a, 0);
+        cudaMemcpy(bootstrap.data(), probe.data, bootstrap.size() * sizeof(float),
+                   cudaMemcpyDeviceToHost);
         PrecisionTensor out = net.forward(nw, h, state, net_a, 0);
         cudaDeviceSynchronize();
         cudaMemcpy(hid.data(), out.data, hid.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        for (int i = 0; i < B * HID; i++)
+            worst = fmaxf(worst, fabsf(bootstrap[i] - hid[i]));
         for (int b = 0; b < B; b++) {
             for (int k = 0; k < ACT; k++) {
                 float v = pw[2080 + k];
                 for (int j = 0; j < HID; j++) v += pw[2016 + k * HID + j] * hid[b * HID + j];
-                float err = fabsf(v - fout[(t * B + b) * ACT + k]);
+                float err = fabsf(v - fout[(fixture_t * B + b) * ACT + k]);
                 if (err > worst) worst = err;
             }
         }
     }
-    printf("max|CUDA rollout - shipped fixture| = %.3e over %d steps x %d agents\n", worst, TT, B);
+    printf("max|CUDA rollout/reset/copied bootstrap - fixture| = %.3e over %d steps x %d agents\n", worst, TT, B);
     printf("%s\n", worst < 1e-4f ? "PASS" : "FAIL");
     return worst >= 1e-4f;
 }
@@ -482,13 +492,76 @@ static int decoder_grad() {
         printf("gradcheck %-11s max relative error = %.3e  %s\n", it.name, worst,
                worst <= 2e-2f ? "PASS" : "FAIL");
     }
+    cudaMemset(fl.data, 0, gl.size() * sizeof(float));
+    loss();
+    PrecisionTensor dh = dec.backward(dwp, dec_a, fl, fs, fv, 0);
+    cudaDeviceSynchronize();
+    int leaked = 0;
+    for (PrecisionTensor* t : {&dh, &da->wgrad, &da->bgrad}) {
+        std::vector<float> grad(numel(t->shape));
+        cudaMemcpy(grad.data(), t->data, grad.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        for (float v : grad) leaked += v != 0.0f;
+    }
+    std::vector<float> critic_grad(numel(da->c3wgrad.shape));
+    cudaMemcpy(critic_grad.data(), da->c3wgrad.data, critic_grad.size() * sizeof(float),
+        cudaMemcpyDeviceToHost);
+    float critic_norm = 0;
+    for (float v : critic_grad) critic_norm += v * v;
+    bool detached = leaked == 0 && std::isfinite(critic_norm) && critic_norm > 0;
+    printf("critic-only loss leaves actor/trunk gradients zero  %s\n", detached ? "PASS" : "FAIL");
+    fails += !detached;
     return fails;
+}
+
+// The trainer seeds through init_weights + RAPTOR_POLICY_BLOB, not manual uploads.
+static int blob_init() {
+    setenv("RAPTOR_POLICY_BLOB", "../../../../artifacts/raptor/base_policy.bin", 1);
+    std::vector<float> pw = read_file("../../../../artifacts/raptor/base_policy.bin", 0);
+    Encoder enc = {.in_dim = OBS, .out_dim = HID};
+    create_raptor_encoder(&enc);
+    Decoder dec = {.hidden_dim = HID, .output_dim = ACT, .continuous = true};
+    create_raptor_decoder(&dec);
+    Network net = {.hidden = HID, .num_layers = 1, .horizon = 8};
+    create_raptor_network(&net);
+    void* ew = enc.create_weights(&enc);
+    void* dwp = dec.create_weights(&dec);
+    void* nw = net.create_weights(&net);
+    Allocator params = {};
+    enc.reg_params(ew, &params);
+    dec.reg_params(dwp, &params);
+    net.reg_params(nw, &params);
+    alloc_create(&params);
+    uint64_t seed = 7;
+    enc.init_weights(ew, &seed, 0);
+    dec.init_weights(dwp, &seed, 0);
+    net.init_weights(nw, &seed, 0);
+    cudaDeviceSynchronize();
+
+    RaptorEncWeights* e = (RaptorEncWeights*)ew;
+    RaptorDecWeights* d = (RaptorDecWeights*)dwp;
+    RaptorGRUWeights* g = (RaptorGRUWeights*)nw;
+    struct Slot { const char* name; PrecisionTensor* t; long offset; };
+    Slot slots[] = {{"enc.w", &e->w, 0}, {"enc.b", &e->b, 352}, {"gru.wi", &g->wi, 368},
+        {"gru.wh", &g->wh, 1136}, {"gru.bi", &g->bi, 1904}, {"gru.bh", &g->bh, 1952},
+        {"gru.h0", &g->h0, 2000}, {"actor.w", &d->w, 2016}, {"actor.b", &d->b, 2080}};
+    int bad = 0;
+    long checked = 0;
+    for (Slot& s : slots) {
+        long n = numel(s.t->shape);
+        std::vector<float> got(n);
+        cudaMemcpy(got.data(), s.t->data, n * sizeof(float), cudaMemcpyDeviceToHost);
+        for (long i = 0; i < n; i++) bad += got[i] != pw[s.offset + i];
+        checked += n;
+    }
+    printf("blob init %ld/%ld actor floats seeded bit-exactly from the shipped policy  %s\n",
+           checked - bad, checked, bad ? "FAIL" : "PASS");
+    return bad != 0;
 }
 
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "--layout") == 0) return layout(true);
     int fails = parity() + parity_rollout() + gradcheck(false) + gradcheck(true) + layout()
-        + optim_placement() + decoder_grad();
+        + optim_placement() + decoder_grad() + blob_init();
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails != 0;
 }

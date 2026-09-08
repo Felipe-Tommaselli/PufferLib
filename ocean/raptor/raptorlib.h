@@ -1,6 +1,7 @@
 #pragma once
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include "airframe.h"
 
 typedef struct {
@@ -12,21 +13,71 @@ typedef struct {
     float last_action[4];
     float target[3];
     float target_velocity[3];
+    float target_yaw;
 } State;
 
 typedef struct {
     float amplitude;
     float period;
+    float amplitude_min;
+    float period_min;
+    float moving_fraction;
+    float ramp;
+    float circuit_fraction;
+    float aspect;
 } TrajParams;
 
-static inline void trajectory(const TrajParams* tr, float t, float* p, float* v) {
-    float w = (tr->amplitude > 0 && tr->period > 0) ? 2.0f * 3.14159265358979f / tr->period : 0.0f;
-    p[0] = tr->amplitude * sinf(w * t);
-    p[1] = 0.5f * tr->amplitude * sinf(2.0f * w * t);
-    p[2] = 0.0f;
-    v[0] = tr->amplitude * w * cosf(w * t);
-    v[1] = tr->amplitude * w * cosf(2.0f * w * t);
-    v[2] = 0.0f;
+typedef struct {
+    float amplitude, period, phase, direction, heading, ramp;
+    bool face_travel;
+    bool circuit;
+    float aspect;
+} Trajectory;
+
+static inline void trajectory(const Trajectory* tr, float t, float* p, float* v) {
+    float clock = t, speed = 1.0f;
+    if (tr->ramp > 0) {
+        float u = fminf(t / tr->ramp, 1.0f);
+        speed = u * u * (3.0f - 2.0f * u);
+        clock = t < tr->ramp ? tr->ramp * u * u * u * (1.0f - 0.5f * u) : t - 0.5f * tr->ramp;
+    }
+    float w = tr->amplitude > 0 ? tr->direction * 2.0f * 3.14159265358979f / tr->period : 0;
+    float phase = tr->phase + w * clock;
+    float x, y, vx, vy;
+    if (tr->circuit) {
+        float segment = phase * (2.0f / 3.14159265358979f);
+        float whole = floorf(segment), u = segment - whole;
+        int start = ((int)fmodf(whole, 4.0f) + 4) % 4;
+        float basis[4] = {(1-u)*(1-u)*(1-u)/6, (3*u*u*u-6*u*u+4)/6,
+                          (-3*u*u*u+3*u*u+3*u+1)/6, u*u*u/6};
+        float derivative[4] = {-0.5f*(1-u)*(1-u), 1.5f*u*u-2*u,
+                               -1.5f*u*u+u+0.5f, 0.5f*u*u};
+        static const float corners[4][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}};
+        x = y = vx = vy = 0;
+        for (int i = 0; i < 4; i++) {
+            const float* point = corners[(start + i) % 4];
+            x += basis[i] * point[0];
+            y += basis[i] * point[1];
+            vx += derivative[i] * point[0];
+            vy += derivative[i] * point[1];
+        }
+        x *= tr->amplitude;
+        y *= tr->amplitude * tr->aspect;
+        vx *= tr->amplitude * w * speed * (2.0f / 3.14159265358979f);
+        vy *= tr->amplitude * tr->aspect * w * speed * (2.0f / 3.14159265358979f);
+    } else {
+        x = tr->amplitude * sinf(phase);
+        y = tr->aspect * tr->amplitude * sinf(2.0f * phase);
+        vx = tr->amplitude * w * speed * cosf(phase);
+        vy = 2.0f * tr->aspect * tr->amplitude * w * speed * cosf(2.0f * phase);
+    }
+    float c = cosf(tr->heading), s = sinf(tr->heading);
+    p[0] = c * x - s * y;
+    p[1] = s * x + c * y;
+    p[2] = 0;
+    v[0] = c * vx - s * vy;
+    v[1] = s * vx + c * vy;
+    v[2] = 0;
 }
 
 typedef struct {
@@ -64,7 +115,7 @@ typedef struct {
 } InitParams;
 
 static const RewardParams REWARD_FOUNDATION = {
-    1.0f, 1.5f, -100.0f, 1.0f, 0.2f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false,
+    1.0f, 1.5f, -100.0f, 1.0f, 0.1f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false,
 };
 
 static const TerminationParams TERMINATION_FOUNDATION = {true, 1.0f, 2.0f, 35.0f};
@@ -107,6 +158,10 @@ static inline float rnd_uniform(unsigned int* rng, float lo, float hi) {
     return lo + (hi - lo) * ((float)rand_r(rng) / (float)RAND_MAX);
 }
 
+static inline bool rnd_bernoulli(unsigned int* rng, float probability) {
+    return (double)rand_r(rng) < probability * ((double)RAND_MAX + 1.0);
+}
+
 static inline float rnd_normal(unsigned int* rng) {
     float u1 = rnd_uniform(rng, 1e-7f, 1.0f);
     float u2 = rnd_uniform(rng, 0.0f, 1.0f);
@@ -126,16 +181,16 @@ static inline float hover_throttle(const Airframe* p) {
 static void randomize_airframe(Airframe* p, float dr, unsigned int* rng) {
     if (dr <= 0) return;
     float hover_nominal = hover_throttle(p);
-    p->mass *= rnd_uniform(rng, 1 - 0.30f * dr, 1 + 0.40f * dr);
+    p->mass *= rnd_uniform(rng, 1 - 0.15f * dr, 1 + 0.15f * dr);
     for (int k = 0; k < 3; k++) {
-        p->J[k][k] *= rnd_uniform(rng, 1 - 0.30f * dr, 1 + 0.40f * dr);
+        p->J[k][k] *= rnd_uniform(rng, 1 - 0.04f * dr, 1 + 0.04f * dr);
         p->J_inv[k][k] = 1.0f / p->J[k][k];
     }
-    float thrust = rnd_uniform(rng, 1 - 0.20f * dr, 1 + 0.20f * dr);
-    float torque = rnd_uniform(rng, 1 - 0.20f * dr, 1 + 0.20f * dr);
-    float tau_r = rnd_uniform(rng, 1 - 0.40f * dr, 1 + 0.60f * dr);
-    float tau_f = rnd_uniform(rng, 1 - 0.40f * dr, 1 + 0.60f * dr);
-    float arm = rnd_uniform(rng, 1 - 0.10f * dr, 1 + 0.10f * dr);
+    float thrust = rnd_uniform(rng, 1 - 0.15f * dr, 1 + 0.15f * dr);
+    float torque = rnd_uniform(rng, 1 - 0.04f * dr, 1 + 0.04f * dr);
+    float tau_r = rnd_uniform(rng, 1 - 0.04f * dr, 1 + 0.04f * dr);
+    float tau_f = rnd_uniform(rng, 1 - 0.04f * dr, 1 + 0.04f * dr);
+    float arm = rnd_uniform(rng, 1 - 0.04f * dr, 1 + 0.04f * dr);
     for (int i = 0; i < 4; i++) {
         for (int k = 0; k < 3; k++) {
             p->rotor_thrust_coefficients[i][k] *= thrust;
