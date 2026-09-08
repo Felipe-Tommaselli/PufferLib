@@ -198,7 +198,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         wandb.init(id=run_id, config=args,
             project=args['wandb_project'], group=args['wandb_group'],
             tags=[args['tag']] if args['tag'] is not None else [],
-            settings=wandb.Settings(console="off"),
+            settings=wandb.Settings(console="off", x_disable_stats=True),
         )
 
     target_key = f'env/{args["sweep"]["metric"]}'
@@ -271,7 +271,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             print_dashboard(args, model_size, flat_logs)
 
         if args['wandb']:
-            wandb.log(flat_logs, step=flat_logs['agent_steps'])
+            skip = set(args['wandb_skip'].split(','))
+            wandb.log({k if '/' in k else f'perf/{k}': v for k, v in flat_logs.items()
+                if k not in skip and k != 'agent_steps'}, step=flat_logs['agent_steps'])
 
         if target_key not in flat_logs:
             continue
@@ -593,6 +595,8 @@ def load_config(env_name):
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
+    parser.add_argument('--wandb-skip', type=str, default='',
+        help='Comma-separated log keys to omit from wandb')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
     parser.add_argument('--save-frames', type=int, default=0)
