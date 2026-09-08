@@ -466,4 +466,143 @@ void alloc_free(Allocator* alloc) {
     alloc->total_bytes = 0;
 }
 
+__global__ void store_bootstrap_tail(precision_t* tail, const precision_t* output,
+        const float* rewards, const float* terminals, const float* truncations,
+        int start, int B, int total, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B) return;
+    tail[start + i] = from_float(fminf(1.0f, fmaxf(-1.0f, rewards[i])));
+    tail[total + start + i] = from_float(terminals[i]);
+    tail[2 * total + start + i] = terminals[i] == 0.0f
+        || (truncations && truncations[i] > 0.0f) ? output[i * cols + cols - 1] : from_float(0.0f);
+}
+
+// Experience the puffer advantage! Generalized advantage estimation + V-Trace
+// importance sampling correction in a single streamlined operation
+__device__ void puff_advantage_row_scalar(
+        const precision_t* values, const precision_t* rewards, const precision_t* dones,
+        const precision_t* importance, precision_t* advantages, float gamma, float lambda,
+        float rho_clip, float c_clip, int horizon, const precision_t* timeout_values,
+        const precision_t* tail, int tail_stride) {
+    float lastpufferlam = 0.0f;
+    advantages[horizon - 1] = from_float(0.0f);
+    for (int t = horizon - (tail ? 1 : 2); t >= 0; t--) {
+        int next = t + 1;
+        bool end = next == horizon;
+        float done = to_float(end ? tail[tail_stride] : dones[next]);
+        float reward = to_float(end ? tail[0] : rewards[next]);
+        float next_value = end ? to_float(tail[2 * tail_stride])
+            : (done == 0.0f ? to_float(values[next]) : 0.0f)
+                + (timeout_values ? to_float(timeout_values[next]) : 0.0f);
+        float imp = to_float(importance[t]);
+        float rho = fminf(imp, rho_clip), c = fminf(imp, c_clip);
+        float delta = rho * (reward + gamma * next_value - to_float(values[t]));
+        lastpufferlam = delta + gamma * lambda * c * lastpufferlam * (1.0f - done);
+        advantages[t] = from_float(lastpufferlam);
+    }
+}
+
+// These loading fns just optimize bandwidth for advantage since we call it on all
+// the data every minibatch. This should change in 5.0
+__device__ __forceinline__ void adv_vec_load(const float* ptr, float* out) {
+    float4 v = *reinterpret_cast<const float4*>(ptr);
+    out[0] = v.x; out[1] = v.y; out[2] = v.z; out[3] = v.w;
+}
+
+__device__ __forceinline__ void adv_vec_load(const __nv_bfloat16* ptr, float* out) {
+    uint4 raw = *reinterpret_cast<const uint4*>(ptr);
+    const __nv_bfloat16* bf = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        out[i] = __bfloat162float(bf[i]);
+    }
+}
+
+// Store N floats as precision_t via 128-bit writes (float4 for f32, uint4 for bf16)
+__device__ __forceinline__ void adv_vec_store(float* ptr, const float* vals) {
+    *reinterpret_cast<float4*>(ptr) = make_float4(vals[0], vals[1], vals[2], vals[3]);
+}
+
+__device__ __forceinline__ void adv_vec_store(__nv_bfloat16* ptr, const float* vals) {
+    // N=8 for bf16: all 8 elements fit in one uint4 (128 bits)
+    __nv_bfloat16 tmp[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) tmp[i] = __float2bfloat16(vals[i]);
+    *reinterpret_cast<uint4*>(ptr) = *reinterpret_cast<const uint4*>(tmp);
+}
+
+__device__ __forceinline__ void puff_advantage_row_vec(
+        const precision_t* values, const precision_t* rewards, const precision_t* dones,
+        const precision_t* importance, precision_t* advantages, float gamma, float lambda,
+        float rho_clip, float c_clip, int horizon, const precision_t* timeout_values,
+        const precision_t* tail, int tail_stride) {
+    constexpr int N = 16 / sizeof(precision_t);
+
+    float lastpufferlam = 0.0f;
+    int num_chunks = horizon / N;
+
+    float next_done = to_float(tail ? tail[tail_stride] : dones[horizon - 1]);
+    float next_reward = to_float(tail ? tail[0] : rewards[horizon - 1]);
+    float next_value = tail ? to_float(tail[2 * tail_stride])
+        : (next_done == 0.0f ? to_float(values[horizon - 1]) : 0.0f)
+            + (timeout_values ? to_float(timeout_values[horizon - 1]) : 0.0f);
+
+    for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
+        int base = chunk * N;
+
+        float v[N], r[N], d[N], imp[N], timeout[N] = {};
+        adv_vec_load(values + base, v);
+        adv_vec_load(rewards + base, r);
+        adv_vec_load(dones + base, d);
+        adv_vec_load(importance + base, imp);
+        if (timeout_values) adv_vec_load(timeout_values + base, timeout);
+
+        float adv[N] = {0};
+        int start_idx = (chunk == num_chunks - 1 && !tail) ? (N - 2) : (N - 1);
+
+        #pragma unroll
+        for (int i = start_idx; i >= 0; i--) {
+            float nextnonterminal = 1.0f - next_done;
+            float rho_t = fminf(imp[i], rho_clip);
+            float c_t = fminf(imp[i], c_clip);
+            float delta = rho_t * (next_reward + gamma * next_value - v[i]);
+            lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
+            adv[i] = lastpufferlam;
+            next_value = (d[i] == 0.0f ? v[i] : 0.0f) + timeout[i];
+            next_done = d[i];
+            next_reward = r[i];
+        }
+
+        adv_vec_store(advantages + base, adv);
+    }
+}
+
+__global__ void puff_advantage(const precision_t* values, const precision_t* rewards,
+        const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
+        float lambda, float rho_clip, float c_clip, int num_steps, int horizon,
+        const precision_t* timeout_values, const precision_t* tail) {
+    int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= num_steps) {
+        return;
+    }
+    int offset = row*horizon;
+    puff_advantage_row_vec(values + offset, rewards + offset, dones + offset,
+        importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon,
+        timeout_values ? timeout_values + offset : nullptr, tail ? tail + row : nullptr, num_steps);
+}
+
+__global__ void puff_advantage_scalar(const precision_t* values, const precision_t* rewards,
+        const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
+        float lambda, float rho_clip, float c_clip, int num_steps, int horizon,
+        const precision_t* timeout_values, const precision_t* tail) {
+    int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= num_steps) {
+        return;
+    }
+    int offset = row*horizon;
+    puff_advantage_row_scalar(values + offset, rewards + offset, dones + offset,
+        importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon,
+        timeout_values ? timeout_values + offset : nullptr, tail ? tail + row : nullptr, num_steps);
+}
+
 #endif // PUFFERLIB_KERNELS_CU

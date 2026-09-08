@@ -1,136 +1,109 @@
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include "c_advantage.cu"
+#include "../src/kernels.cu"
+#include <vector>
 
-// Kernel declaration
-__global__ void advantage_kernel(
-    float* reward_block, float* reward_mask, float* values_mean,
-    float* values_std, float* buf, float* dones, float* rewards,
-    float* advantages, int* bounds, int num_steps, float r_std, int horizon
-);
+static precision_t* upload(const std::vector<float>& values) {
+    std::vector<precision_t> host(values.size());
+    for (size_t i = 0; i < values.size(); i++) host[i] = from_float(values[i]);
+    precision_t* device;
+    cudaMalloc(&device, host.size() * sizeof(precision_t));
+    cudaMemcpy(device, host.data(), host.size() * sizeof(precision_t), cudaMemcpyHostToDevice);
+    return device;
+}
 
-#define NUM_STEPS 6
-#define HORIZON 4
-
-float test_values_mean[NUM_STEPS * HORIZON] = {
-    1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f,
-};
-
-float g = sqrt(0.5f);
-
-float test_values_std[NUM_STEPS * HORIZON] = {
-    g, g, g, g,
-    g, g, g, g,
-    g, g, g, g,
-    g, g, g, g,
-    g, g, g, g,
-};
-
-float test_dones[NUM_STEPS] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
-float test_rewards[NUM_STEPS] = {0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f};
+static int check(const char* name, int T, const std::vector<float>& values,
+        const std::vector<float>& rewards, const std::vector<float>& dones,
+        const std::vector<float>& importance, const std::vector<float>& timeouts,
+        const std::vector<float>& expected, bool with_tail) {
+    const int B = 3;
+    precision_t* v = upload(values), *r = upload(rewards), *d = upload(dones);
+    precision_t* imp = upload(importance), *tv = timeouts.empty() ? nullptr : upload(timeouts);
+    precision_t* advantages = upload(std::vector<float>(B * T, -555.0f));
+    precision_t* tail = with_tail ? upload(std::vector<float>(3 * B)) : nullptr;
+    precision_t* output = upload({-77.0f, 4.0f, -77.0f, 6.0f, -77.0f, 99.0f});
+    float env_host[] = {0.25f, 0.25f, 0.25f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+    float* env;
+    cudaMalloc(&env, sizeof(env_host));
+    cudaMemcpy(env, env_host, sizeof(env_host), cudaMemcpyHostToDevice);
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    int failures = 0;
+    constexpr int N = 16 / sizeof(precision_t);
+    for (int vectorized = 0; vectorized <= (T % N == 0); vectorized++) {
+        for (int captured = 0; captured < 2; captured++) {
+            if (captured) cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            if (tail) store_bootstrap_tail<<<1, 32, 0, stream>>>(
+                tail, output, env, env + B, env + 2 * B, 0, B, B, 2);
+            auto kernel = vectorized ? puff_advantage : puff_advantage_scalar;
+            kernel<<<1, 32, 0, stream>>>(v, r, d, imp, advantages,
+                0.5f, 0.5f, 1.0f, 1.0f, B, T, tv, tail);
+            cudaGraphExec_t executable = nullptr;
+            if (captured) {
+                cudaGraph_t graph;
+                cudaStreamEndCapture(stream, &graph);
+                cudaGraphInstantiate(&executable, graph, 0);
+                cudaGraphDestroy(graph);
+                cudaGraphLaunch(executable, stream);
+            }
+            cudaError_t err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess) {
+                printf("%s: %s\n", name, cudaGetErrorString(err));
+                exit(1);
+            }
+            std::vector<precision_t> host(B * T);
+            cudaMemcpy(host.data(), advantages, host.size() * sizeof(precision_t), cudaMemcpyDeviceToHost);
+            int bad = 0;
+            for (int i = 0; i < B * T; i++) {
+                float got = to_float(host[i]);
+                float tolerance = USE_BF16 ? 0.04f : 1e-5f;
+                if (!isfinite(got) || fabsf(got - expected[i]) > tolerance) {
+                    printf("%s row=%d t=%d: got %g expected %g\n", name, i / T, i % T, got, expected[i]);
+                    bad++;
+                }
+            }
+            failures += bad;
+            printf("%s %s %s: %s\n", name, vectorized ? "vector" : "scalar",
+                captured ? "graph" : "eager", bad ? "FAIL" : "PASS");
+            if (executable) cudaGraphExecDestroy(executable);
+        }
+    }
+    cudaStreamDestroy(stream);
+    cudaFree(v); cudaFree(r); cudaFree(d); cudaFree(imp); cudaFree(tv);
+    cudaFree(advantages); cudaFree(tail); cudaFree(output); cudaFree(env);
+    return failures;
+}
 
 int main() {
-    // Test parameters
-    //const int num_steps = 4;
-    //const int horizon = 3;
-    const float r_std = 2.0f;
-    
-    // Calculate sizes
-    const int block_size = NUM_STEPS * HORIZON * sizeof(float);
-    const int steps_size = NUM_STEPS * sizeof(float);
-    const int bounds_size = NUM_STEPS * sizeof(int);
-
-    // Host buffers
-    float* h_reward_block = (float*)malloc(block_size);
-    float* h_reward_mask = (float*)malloc(block_size);
-    float* h_values_mean = (float*)malloc(block_size);
-    float* h_values_std = (float*)malloc(block_size);
-    float* h_buf = (float*)malloc(block_size);
-    float* h_dones = (float*)malloc(steps_size);
-    float* h_rewards = (float*)malloc(steps_size);
-    float* h_advantages = (float*)malloc(steps_size);
-    int* h_bounds = (int*)malloc(bounds_size);
-
-    // Device buffers
-    float *d_reward_block, *d_reward_mask, *d_values_mean, *d_values_std;
-    float *d_buf, *d_dones, *d_rewards, *d_advantages;
-    int* d_bounds;
-
-    // Allocate device memory
-    cudaMalloc((void**)&d_reward_block, block_size);
-    cudaMalloc((void**)&d_reward_mask, block_size);
-    cudaMalloc((void**)&d_values_mean, block_size);
-    cudaMalloc((void**)&d_values_std, block_size);
-    cudaMalloc((void**)&d_buf, block_size);
-    cudaMalloc((void**)&d_dones, steps_size);
-    cudaMalloc((void**)&d_rewards, steps_size);
-    cudaMalloc((void**)&d_advantages, steps_size);
-    cudaMalloc((void**)&d_bounds, bounds_size);
-
-    // Initialize test data
-    // Copy input data to device
-    cudaMemcpy(d_values_mean, test_values_mean, block_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_values_std, test_values_std, block_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dones, test_dones, steps_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_rewards, test_rewards, steps_size, cudaMemcpyHostToDevice);
-
-    // Launch configuration
-    int threadsPerBlock = 256;
-    int blocks = (NUM_STEPS + threadsPerBlock - 1) / threadsPerBlock;
-
-    // Launch kernel
-    advantage_kernel<<<blocks, threadsPerBlock>>>(
-        d_reward_block, d_reward_mask, d_values_mean, d_values_std,
-        d_buf, d_dones, d_rewards, d_advantages, d_bounds,
-        NUM_STEPS, r_std, HORIZON
-    );
-
-    cudaGetLastError();
-    cudaDeviceSynchronize();
-
-    // Copy results back to host
-    cudaMemcpy(h_reward_block, d_reward_block, block_size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_reward_mask, d_reward_mask, block_size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_advantages, d_advantages, steps_size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bounds, d_bounds, bounds_size, cudaMemcpyDeviceToHost);
-
-    // Print results
-    printf("Advantages:\n");
-    for (int i = 0; i < NUM_STEPS; i++) {
-        printf("%.2f ", h_advantages[i]);
-    }
-    printf("\nBounds:\n");
-    for (int i = 0; i < NUM_STEPS; i++) {
-        printf("%d ", h_bounds[i]);
-    }
-    printf("\nReward Block:\n");
-    for (int i = 0; i < NUM_STEPS; i++) {
-        for (int j = 0; j < HORIZON; j++) {
-            printf("%.2f ", h_reward_block[i * HORIZON + j]);
+    int failures = check("horizon-one", 1, {2, 2, 2}, {777, 777, 777}, {1, 1, 1},
+        {0.5f, 1, 2}, {}, {0.125f, 1.25f, -1.75f}, true);
+    failures += check("odd-horizon-boundaries", 3,
+        {2, 10, 14, 2, 10, 14, 2, 10, 14},
+        {777, 0.25f, 0.25f, 777, 0.25f, 0.25f, 777, 0.25f, 0.25f},
+        {0, 1, 1, 0, 1, 1, 0, 1, 1}, std::vector<float>(9, 0.5f),
+        {0, 6, 0, 0, 6, 0, 0, 6, 0},
+        {0.625f, -4.875f, -5.875f, 0.625f, -4.875f, -5.375f, 0.625f, -4.875f, -6.875f}, true);
+    failures += check("generic-no-tail", 3, std::vector<float>(9, 2),
+        std::vector<float>(9, 0.25f), {0, 0, 1, 0, 0, 1, 0, 0, 1},
+        std::vector<float>(9, 0.5f), {},
+        {-0.484375f, -0.875f, 0, -0.484375f, -0.875f, 0, -0.484375f, -0.875f, 0}, false);
+    for (int T : {8, 16}) {
+        std::vector<float> v(3 * T, 2), r(3 * T, 0.25f), d(3 * T), tv(3 * T), expected(3 * T);
+        const float last[] = {0.25f, 1.25f, -1.75f};
+        for (int b = 0; b < 3; b++) {
+            for (int offset = 0; offset < T; offset += 8) {
+                int i = b * T + offset;
+                v[i + 3] = 10;
+                v[i + 5] = 14;
+                d[i + 3] = d[i + 5] = 1;
+                tv[i + 3] = 6;
+                float end = offset + 8 == T ? last[b] : 0.25f;
+                const float want[] = {-0.859375f, -0.4375f, 1.25f, -9.1875f, -1.75f,
+                    -12.75f + 0.25f * (-0.75f + 0.25f * end), -0.75f + 0.25f * end, end};
+                for (int t = 0; t < 8; t++) expected[i + t] = want[t];
+                if (offset) { d[i] = 1; tv[i] = 4; }
+            }
         }
-        printf("\n");
+        failures += check(T == 8 ? "mixed-boundaries" : "vector-chunk-boundary", T,
+            v, r, d, std::vector<float>(3 * T, 1), tv, expected, true);
     }
-
-    // Cleanup
-    cudaFree(d_reward_block); cudaFree(d_reward_mask);
-    cudaFree(d_values_mean); cudaFree(d_values_std);
-    cudaFree(d_buf); cudaFree(d_dones);
-    cudaFree(d_rewards); cudaFree(d_advantages);
-    cudaFree(d_bounds);
-
-    free(h_reward_block); free(h_reward_mask);
-    free(h_values_mean); free(h_values_std);
-    free(h_buf); free(h_dones);
-    free(h_rewards); free(h_advantages);
-    free(h_bounds);
-
-    return 0;
+    return failures != 0;
 }

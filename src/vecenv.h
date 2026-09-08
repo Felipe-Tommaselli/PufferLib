@@ -82,11 +82,15 @@ typedef struct StaticVec {
     float* actions;
     float* rewards;
     float* terminals;
+    float* truncations;  // NULL unless env defines MY_TRUNCATION
+    void* final_observations;
     unsigned char* action_mask;  // NULL unless env defines MY_ACTION_MASK
     void* gpu_observations;
     float* gpu_actions;
     float* gpu_rewards;
     float* gpu_terminals;
+    float* gpu_truncations;
+    void* gpu_final_observations;
     unsigned char* gpu_action_mask;  // NULL unless env defines MY_ACTION_MASK
     cudaStream_t* streams;
     StaticThreading* threading;
@@ -100,6 +104,7 @@ typedef struct StaticVec {
 } StaticVec;
 
 // Callback types
+// t == horizon observes the last transition without producing another action.
 typedef void (*net_callback_fn)(void* ctx, int buf, int t);
 typedef void (*thread_init_fn)(void* ctx, int buf);
 typedef void (*step_fn)(void* env);
@@ -287,6 +292,9 @@ static void* static_omp_threadmanager(void* arg) {
 
             memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
             memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
+#ifdef MY_TRUNCATION
+            memset(&vec->truncations[agent_start], 0, agents_per_buffer * sizeof(float));
+#endif
             clock_gettime(CLOCK_MONOTONIC, &t0);
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
@@ -310,6 +318,17 @@ static void* static_omp_threadmanager(void* arg) {
                 &vec->terminals[agent_start],
                 agents_per_buffer * sizeof(float),
                 cudaMemcpyHostToDevice, stream);
+#ifdef MY_TRUNCATION
+            cudaMemcpyAsync(vec->gpu_truncations + agent_start, vec->truncations + agent_start,
+                agents_per_buffer * sizeof(float), cudaMemcpyHostToDevice, stream);
+            for (int a = agent_start; a < agent_start + agents_per_buffer; a++) {
+                if (vec->truncations[a] == 0.0f) continue;
+                size_t offset = (size_t)a * OBS_SIZE * obs_element_size();
+                cudaMemcpyAsync((char*)vec->gpu_final_observations + offset,
+                    (char*)vec->final_observations + offset, OBS_SIZE * obs_element_size(),
+                    cudaMemcpyHostToDevice, stream);
+            }
+#endif
 #ifdef MY_ACTION_MASK
             cudaMemcpyAsync(
                 vec->gpu_action_mask + agent_start * MY_ACTION_MASK,
@@ -318,6 +337,7 @@ static void* static_omp_threadmanager(void* arg) {
                 cudaMemcpyHostToDevice, stream);
 #endif
         }
+        net_callback(ctx, buf, horizon);
         cudaStreamSynchronize(stream);
         atomic_store(&buffer_states[buf], OMP_WAITING);
     }
@@ -445,6 +465,24 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         vec->gpu_terminals = vec->terminals;
     }
 
+#ifdef MY_TRUNCATION
+    size_t final_bytes = (size_t)total_agents * OBS_SIZE * obs_elem_size;
+    if (gpu) {
+        cudaHostAlloc((void**)&vec->truncations, total_agents * sizeof(float), cudaHostAllocPortable);
+        cudaHostAlloc(&vec->final_observations, final_bytes, cudaHostAllocPortable);
+        cudaMalloc((void**)&vec->gpu_truncations, total_agents * sizeof(float));
+        cudaMalloc(&vec->gpu_final_observations, final_bytes);
+        cudaMemset(vec->gpu_truncations, 0, total_agents * sizeof(float));
+        cudaMemset(vec->gpu_final_observations, 0, final_bytes);
+        memset(vec->truncations, 0, total_agents * sizeof(float));
+    } else {
+        vec->truncations = (float*)calloc(total_agents, sizeof(float));
+        vec->final_observations = calloc(total_agents * OBS_SIZE, obs_elem_size);
+        vec->gpu_truncations = vec->truncations;
+        vec->gpu_final_observations = vec->final_observations;
+    }
+#endif
+
 #ifdef MY_ACTION_MASK
     vec->action_mask_size = MY_ACTION_MASK;
     size_t mask_bytes = (size_t)total_agents * MY_ACTION_MASK * sizeof(unsigned char);
@@ -478,6 +516,10 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
             env->actions = vec->actions + slot * NUM_ATNS;
             env->rewards = vec->rewards + slot;
             env->terminals = vec->terminals + slot;
+#ifdef MY_TRUNCATION
+            env->truncations = vec->truncations + slot;
+            env->final_observations = (void*)((char*)vec->final_observations + slot * OBS_SIZE * obs_elem_size);
+#endif
 #ifdef MY_ACTION_MASK
             env->action_mask = vec->action_mask + slot * MY_ACTION_MASK;
 #endif
@@ -566,6 +608,10 @@ void static_vec_reset(StaticVec* vec) {
     for (int i = 0; i < vec->size; i++) {
         c_reset(&envs[i]);
     }
+#ifdef MY_TRUNCATION
+    memset(vec->truncations, 0, vec->total_agents * sizeof(float));
+    if (vec->gpu) cudaMemset(vec->gpu_truncations, 0, vec->total_agents * sizeof(float));
+#endif
     if (vec->gpu) {
         cudaMemcpy(vec->gpu_observations, vec->observations,
             vec->total_agents * OBS_SIZE * obs_element_size(), cudaMemcpyHostToDevice);
@@ -643,6 +689,12 @@ void static_vec_close(StaticVec* vec) {
         cudaFreeHost(vec->actions);
         cudaFreeHost(vec->rewards);
         cudaFreeHost(vec->terminals);
+#ifdef MY_TRUNCATION
+        cudaFree(vec->gpu_truncations);
+        cudaFree(vec->gpu_final_observations);
+        cudaFreeHost(vec->truncations);
+        cudaFreeHost(vec->final_observations);
+#endif
 #ifdef MY_ACTION_MASK
         cudaFree(vec->gpu_action_mask);
         cudaFreeHost(vec->action_mask);
@@ -652,6 +704,10 @@ void static_vec_close(StaticVec* vec) {
         free(vec->actions);
         free(vec->rewards);
         free(vec->terminals);
+#ifdef MY_TRUNCATION
+        free(vec->truncations);
+        free(vec->final_observations);
+#endif
 #ifdef MY_ACTION_MASK
         free(vec->action_mask);
 #endif
@@ -741,6 +797,9 @@ size_t get_obs_elem_size(void) { return obs_element_size(); }
 static inline void _static_vec_env_step(StaticVec* vec) {
     memset(vec->rewards, 0, vec->total_agents * sizeof(float));
     memset(vec->terminals, 0, vec->total_agents * sizeof(float));
+#ifdef MY_TRUNCATION
+    memset(vec->truncations, 0, vec->total_agents * sizeof(float));
+#endif
     Env* envs = (Env*)vec->envs;
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < vec->size; i++) {
@@ -761,6 +820,17 @@ void gpu_vec_step(StaticVec* vec) {
         vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(vec->gpu_terminals, vec->terminals,
         vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
+#ifdef MY_TRUNCATION
+    cudaMemcpy(vec->gpu_truncations, vec->truncations,
+        vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
+    for (int a = 0; a < vec->total_agents; a++) {
+        if (vec->truncations[a] == 0.0f) continue;
+        size_t offset = (size_t)a * OBS_SIZE * obs_element_size();
+        cudaMemcpy((char*)vec->gpu_final_observations + offset,
+            (char*)vec->final_observations + offset, OBS_SIZE * obs_element_size(),
+            cudaMemcpyHostToDevice);
+    }
+#endif
 }
 
 void cpu_vec_step(StaticVec* vec) {

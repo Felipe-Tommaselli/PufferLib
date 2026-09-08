@@ -49,6 +49,7 @@ static void py_puff_advantage_cpu(
     for (int row = 0; row < num_steps; row++) {
         int off = row * horizon;
         float lastpufferlam = 0;
+        advantages[off + horizon - 1] = 0.0f;
         for (int t = horizon - 2; t >= 0; t--) {
             int t_next = t + 1;
             float nextnonterminal = 1.0f - dones[off + t_next];
@@ -58,7 +59,7 @@ static void py_puff_advantage_cpu(
             float r_nxt = rewards[off + t_next];
             float v = values[off + t];
             float v_nxt = values[off + t_next];
-            float delta = rho_t * r_nxt + gamma * v_nxt * nextnonterminal - v;
+            float delta = rho_t * (r_nxt + gamma * v_nxt * nextnonterminal - v);
             lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
             advantages[off + t] = lastpufferlam;
         }
