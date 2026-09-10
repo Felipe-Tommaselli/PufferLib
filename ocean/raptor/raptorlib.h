@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include "airframe.h"
 
 typedef struct {
@@ -25,14 +26,23 @@ typedef struct {
     float ramp;
     float circuit_fraction;
     float aspect;
+    int original;
 } TrajParams;
 
 typedef struct {
     float amplitude, period, phase, direction, heading, ramp;
     bool face_travel;
     bool circuit;
+    bool moving;
+    bool original;
     float aspect;
+    float position[3];
+    float velocity[3];
+    float raw_position[3];
+    float raw_velocity[3];
 } Trajectory;
+
+static inline float rnd_normal(unsigned int* rng);
 
 static inline void trajectory(const Trajectory* tr, float t, float* p, float* v) {
     float clock = t, speed = 1.0f;
@@ -78,6 +88,20 @@ static inline void trajectory(const Trajectory* tr, float t, float* p, float* v)
     v[0] = c * vx - s * vy;
     v[1] = s * vx + c * vy;
     v[2] = 0;
+}
+
+static inline void original_trajectory(Trajectory* tr, float* p, float* v, unsigned int* rng) {
+    if (tr->moving) {
+        for (int i = 0; i < 3; i++) {
+            tr->raw_velocity[i] += (-tr->raw_velocity[i] - 4.0f * tr->raw_position[i]) * RAPTOR_DT
+                                 + 0.5f * sqrtf(RAPTOR_DT) * rnd_normal(rng);
+            tr->raw_position[i] += tr->raw_velocity[i] * RAPTOR_DT;
+            tr->velocity[i] = 0.01f * tr->raw_velocity[i] + 0.99f * tr->velocity[i];
+            tr->position[i] += tr->velocity[i] * RAPTOR_DT;
+        }
+    }
+    memcpy(p, tr->position, sizeof(tr->position));
+    memcpy(v, tr->velocity, sizeof(tr->velocity));
 }
 
 typedef struct {

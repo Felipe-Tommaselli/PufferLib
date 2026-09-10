@@ -388,7 +388,27 @@ static void test_command_continuity(void) {
     env->yaw_face_probability = 0;
     c_reset(env);
     for (int i = 0; i < 64; i++) coherent &= env->agents[i].state.target_yaw == 0;
-    check("T17 continuous task commands", coherent, "both paths, ramp derivative, loop seam, mission bounds, coherent reset and yaw rate");
+    free_env(env);
+    env = make_env(4096, 124);
+    env->traj.original = 1;
+    env->traj.moving_fraction = 0.5f;
+    c_reset(env);
+    int moving = 0, vertical = 0;
+    float min_yaw = 4, max_yaw = -4;
+    for (int i = 0; i < 4096; i++) {
+        Trajectory* tr = &env->agents[i].trajectory;
+        moving += tr->moving;
+        original_trajectory(tr, env->agents[i].state.target,
+                            env->agents[i].state.target_velocity, &env->rng);
+        vertical += fabsf(tr->velocity[2]) > 0;
+        float yaw = env->agents[i].state.target_yaw;
+        if (yaw < min_yaw) min_yaw = yaw;
+        if (yaw > max_yaw) max_yaw = yaw;
+    }
+    coherent &= moving > 1900 && moving < 2200 && vertical == moving &&
+                min_yaw < -3 && max_yaw > 3;
+    check("T17 continuous task commands", coherent,
+          "periodic evaluation; original 50/50 3D commands with full independent yaw");
     free_env(env);
 }
 
@@ -442,7 +462,7 @@ static void test_timeout_and_applied_action(void) {
 
 typedef struct {
     int episodes;
-    float ret, length, position_error, settle_error, settle_n, d_action, terminated;
+    float ret, length, position_error, velocity_error, settle_error, settle_n, d_action, terminated;
     float applied_d_action, saturation, settle_bias[3], settle_across[3], settle_within[3];
 } Replay;
 
@@ -464,6 +484,7 @@ static Replay run_replay(int n, int steps) {
                 .ret = env->log.episode_return / e,
                 .length = env->log.episode_length / e,
                 .position_error = env->log.position_error / e,
+                .velocity_error = env->log.velocity_error / e,
                 .settle_error = env->log.settle_error / (env->log.settle_n > 0 ? env->log.settle_n : 1.0f),
                 .settle_n = env->log.settle_n,
                 .d_action = env->log.d_action / e,
@@ -579,7 +600,7 @@ int main(int argc, char** argv) {
     g_settings.horizon = RAPTOR_HORIZON;
     g_settings.obs_clip = 1;
     g_settings.dr = 1;
-    g_settings.traj = (TrajParams){0.5f, 20.0f, 0.25f, 15.0f, 0.5f, 2.0f, 0.5f, 0.5f};
+    g_settings.traj = (TrajParams){0.5f, 20.0f, 0.25f, 15.0f, 0.5f, 2.0f, 0.5f, 0.5f, 0};
     g_settings.yaw_face_probability = 0.5f;
     g_settings.yaw_rate = 0.4f;
     float orientation_deg = 57.29578f;
@@ -636,6 +657,8 @@ int main(int argc, char** argv) {
             g_airframe = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--horizon") == 0 && i + 1 < argc) {
             g_settings.horizon = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--traj-original") == 0 && i + 1 < argc) {
+            g_settings.traj.original = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--obs-clip") == 0 && i + 1 < argc) {
             g_settings.obs_clip = atoi(argv[++i]);
         } else if (strncmp(argv[i], "--", 2) == 0) {
@@ -655,8 +678,9 @@ int main(int argc, char** argv) {
     }
     g_settings.init_params.max_angle = orientation_deg * 3.14159265358979f / 180.0f;
     if (g_airframe < 0 || g_airframe >= (int)(sizeof(AIRFRAMES) / sizeof(AIRFRAMES[0])) ||
-        g_settings.horizon <= 0 || (g_settings.obs_clip != 0 && g_settings.obs_clip != 1)) {
-        fprintf(stderr, "Invalid airframe, horizon or observation clipping\n");
+        g_settings.horizon <= 0 || (g_settings.obs_clip != 0 && g_settings.obs_clip != 1) ||
+        (g_settings.traj.original != 0 && g_settings.traj.original != 1)) {
+        fprintf(stderr, "Invalid airframe, horizon, observation clipping or trajectory mode\n");
         return 1;
     }
 
@@ -680,13 +704,14 @@ int main(int argc, char** argv) {
         Replay r = run_replay(mode_args[0] ? atoi(mode_args[0]) : 256,
                               mode_args[1] ? atoi(mode_args[1]) : 5000);
         printf("{\"episodes\": %d, \"return\": %.6f, \"length\": %.4f, \"position_error\": %.6f, "
-               "\"settle_error\": %.6f, \"settle_n\": %.0f, \"d_action\": %.6f, \"terminated\": %.6f, "
+               "\"velocity_error\": %.6f, \"settle_error\": %.6f, \"settle_n\": %.0f, "
+               "\"d_action\": %.6f, \"terminated\": %.6f, "
                "\"applied_d_action\": %.6f, \"saturation\": %.6f, "
                "\"settle_bias_x\": %.6f, \"settle_bias_y\": %.6f, \"settle_bias_z\": %.6f, "
                "\"settle_across_x\": %.6f, \"settle_across_y\": %.6f, \"settle_across_z\": %.6f, "
                "\"settle_within_x\": %.6f, \"settle_within_y\": %.6f, \"settle_within_z\": %.6f}\n",
-               r.episodes, r.ret, r.length, r.position_error, r.settle_error, r.settle_n,
-               r.d_action, r.terminated, r.applied_d_action, r.saturation,
+               r.episodes, r.ret, r.length, r.position_error, r.velocity_error, r.settle_error,
+               r.settle_n, r.d_action, r.terminated, r.applied_d_action, r.saturation,
                r.settle_bias[0], r.settle_bias[1], r.settle_bias[2],
                r.settle_across[0], r.settle_across[1], r.settle_across[2],
                r.settle_within[0], r.settle_within[1], r.settle_within[2]);

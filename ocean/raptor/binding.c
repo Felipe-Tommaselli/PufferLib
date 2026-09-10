@@ -39,16 +39,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->init_params.max_angular_velocity = dict_get(kwargs, "init_angular_velocity")->value;
     env->init_params.min_rpm = dict_get(kwargs, "init_min_rpm")->value;
     env->init_params.max_rpm = dict_get(kwargs, "init_max_rpm")->value;
-    env->traj.amplitude = dict_get(kwargs, "traj_amplitude")->value;
-    env->traj.period = dict_get(kwargs, "traj_period")->value;
-    env->traj.amplitude_min = dict_get(kwargs, "traj_amplitude_min")->value;
-    env->traj.period_min = dict_get(kwargs, "traj_period_min")->value;
+    env->traj.original = (int)dict_get(kwargs, "traj_original")->value;
     env->traj.moving_fraction = dict_get(kwargs, "traj_moving_fraction")->value;
-    env->traj.circuit_fraction = dict_get(kwargs, "traj_circuit_fraction")->value;
-    env->traj.aspect = dict_get(kwargs, "traj_aspect")->value;
-    env->traj.ramp = dict_get(kwargs, "traj_ramp")->value;
-    env->yaw_face_probability = dict_get(kwargs, "yaw_face_probability")->value;
-    env->yaw_rate = dict_get(kwargs, "yaw_rate")->value;
 
     init(env);
 }
@@ -58,6 +50,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_return", log->episode_return / n);
     dict_set(out, "episode_length", log->episode_length / n);
     dict_set(out, "position_error", log->position_error / n);
+    dict_set(out, "velocity_error", log->velocity_error / n);
     dict_set(out, "settle_error", log->settle_error / (log->settle_n > 0.0f ? log->settle_n : 1.0f));
     dict_set(out, "settle_n", log->settle_n / n);
     dict_set(out, "d_action", log->d_action / n);

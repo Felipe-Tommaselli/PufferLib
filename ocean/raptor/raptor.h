@@ -10,6 +10,7 @@ struct Log {
     float episode_return;
     float episode_length;
     float position_error;
+    float velocity_error;
     float settle_error;
     float settle_n;
     float d_action;
@@ -30,6 +31,7 @@ typedef struct {
     float episode_return;
     int episode_length;
     float position_error_sum;
+    float velocity_error_sum;
     float d_action_sum;
     float applied_d_action_sum;
     float saturation_sum;
@@ -69,6 +71,7 @@ static void add_log(RaptorEnv* env, Agent* agent, bool term) {
     env->log.episode_return += agent->episode_return;
     env->log.episode_length += agent->episode_length;
     env->log.position_error += agent->position_error_sum / agent->episode_length;
+    env->log.velocity_error += agent->velocity_error_sum / agent->episode_length;
     env->log.settle_error += agent->settle_sum;
     env->log.settle_n += agent->settle_n;
     env->log.d_action += agent->d_action_sum / agent->episode_length;
@@ -95,6 +98,7 @@ static void reset_agent(RaptorEnv* env, int idx) {
     agent->episode_return = 0;
     agent->episode_length = 0;
     agent->position_error_sum = 0;
+    agent->velocity_error_sum = 0;
     agent->d_action_sum = 0;
     agent->applied_d_action_sum = 0;
     agent->saturation_sum = 0;
@@ -103,20 +107,26 @@ static void reset_agent(RaptorEnv* env, int idx) {
     memset(agent->settle_bias, 0, sizeof(agent->settle_bias));
     memset(agent->settle_square, 0, sizeof(agent->settle_square));
     Trajectory* tr = &agent->trajectory;
-    tr->amplitude = rnd_bernoulli(&env->rng, env->traj.moving_fraction) ?
-        rnd_uniform(&env->rng, env->traj.amplitude_min, env->traj.amplitude) : 0;
-    tr->period = rnd_uniform(&env->rng, env->traj.period_min, env->traj.period);
-    tr->phase = rnd_uniform(&env->rng, 0, 2.0f * 3.14159265358979f);
-    tr->direction = rnd_bernoulli(&env->rng, 0.5f) ? 1.0f : -1.0f;
-    tr->heading = rnd_uniform(&env->rng, -3.14159265358979f, 3.14159265358979f);
-    tr->ramp = env->traj.ramp;
-    tr->aspect = env->traj.aspect;
-    tr->face_travel = rnd_bernoulli(&env->rng, env->yaw_face_probability);
-    tr->circuit = rnd_bernoulli(&env->rng, env->traj.circuit_fraction);
+    memset(tr, 0, sizeof(*tr));
+    tr->original = env->traj.original;
+    tr->moving = rnd_bernoulli(&env->rng, env->traj.moving_fraction);
+    if (!tr->original) {
+        tr->amplitude = tr->moving ? rnd_uniform(&env->rng, env->traj.amplitude_min, env->traj.amplitude) : 0;
+        tr->period = rnd_uniform(&env->rng, env->traj.period_min, env->traj.period);
+        tr->phase = rnd_uniform(&env->rng, 0, 2.0f * 3.14159265358979f);
+        tr->direction = rnd_bernoulli(&env->rng, 0.5f) ? 1.0f : -1.0f;
+        tr->heading = rnd_uniform(&env->rng, -3.14159265358979f, 3.14159265358979f);
+        tr->ramp = env->traj.ramp;
+        tr->aspect = env->traj.aspect;
+        tr->face_travel = rnd_bernoulli(&env->rng, env->yaw_face_probability);
+        tr->circuit = rnd_bernoulli(&env->rng, env->traj.circuit_fraction);
+    }
     reset_state(&agent->airframe, &env->init_params, &agent->state, &env->rng);
     State* s = &agent->state;
-    if (tr->face_travel) s->target_yaw = tr->heading;
-    trajectory(tr, 0.0f, s->target, s->target_velocity);
+    if (tr->original) s->target_yaw = rnd_uniform(&env->rng, -3.14159265358979f, 3.14159265358979f);
+    else if (tr->face_travel) s->target_yaw = tr->heading;
+    if (tr->original) original_trajectory(tr, s->target, s->target_velocity, &env->rng);
+    else trajectory(tr, 0.0f, s->target, s->target_velocity);
     if (tr->face_travel && tr->amplitude > 0) {
         Trajectory tangent = *tr;
         tangent.ramp = 0;
@@ -159,7 +169,11 @@ void c_step(RaptorEnv* env) {
 
         State next;
         physics_step(&agent->airframe, &agent->state, action, &next);
-        trajectory(&agent->trajectory, (agent->episode_length + 1) * RAPTOR_DT, next.target, next.target_velocity);
+        if (agent->trajectory.original)
+            original_trajectory(&agent->trajectory, next.target, next.target_velocity, &env->rng);
+        else
+            trajectory(&agent->trajectory, (agent->episode_length + 1) * RAPTOR_DT,
+                       next.target, next.target_velocity);
         if (agent->trajectory.face_travel &&
             next.target_velocity[0] * next.target_velocity[0] + next.target_velocity[1] * next.target_velocity[1] > 1e-12f) {
             float desired = atan2f(next.target_velocity[1], next.target_velocity[0]);
@@ -185,6 +199,10 @@ void c_step(RaptorEnv* env) {
               ez = next.position[2] - next.target[2];
         float e = sqrtf(ex * ex + ey * ey + ez * ez);
         agent->position_error_sum += e;
+        float vx = next.linear_velocity[0] - next.target_velocity[0],
+              vy = next.linear_velocity[1] - next.target_velocity[1],
+              vz = next.linear_velocity[2] - next.target_velocity[2];
+        agent->velocity_error_sum += sqrtf(vx * vx + vy * vy + vz * vz);
         if (agent->episode_length * 4 >= env->horizon * 3) {
             agent->settle_sum += e;
             agent->settle_n += 1;
@@ -217,12 +235,13 @@ void c_step(RaptorEnv* env) {
 
 void init(RaptorEnv* env) {
     if (!(isfinite(env->dr) && env->dr >= 0 && env->dr < 1.0f / 0.15f &&
-          env->traj.amplitude_min >= 0 && env->traj.amplitude >= env->traj.amplitude_min &&
-          env->traj.period_min > 0 && env->traj.period >= env->traj.period_min &&
           env->traj.moving_fraction >= 0 && env->traj.moving_fraction <= 1 &&
-          env->traj.circuit_fraction >= 0 && env->traj.circuit_fraction <= 1 &&
-          env->traj.aspect > 0 &&
-          env->traj.ramp >= 0 && env->yaw_face_probability >= 0 && env->yaw_face_probability <= 1 &&
+          (env->traj.original ||
+           (env->traj.amplitude_min >= 0 && env->traj.amplitude >= env->traj.amplitude_min &&
+            env->traj.period_min > 0 && env->traj.period >= env->traj.period_min &&
+            env->traj.circuit_fraction >= 0 && env->traj.circuit_fraction <= 1 &&
+            env->traj.aspect > 0 && env->traj.ramp >= 0)) &&
+          env->yaw_face_probability >= 0 && env->yaw_face_probability <= 1 &&
           env->yaw_rate >= 0)) {
         fprintf(stderr, "Invalid DR, trajectory or yaw settings\n");
         abort();
