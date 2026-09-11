@@ -415,6 +415,7 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.horizon = get_config(train_kwargs, "horizon");
     // Model architecture (num_atns computed from env in C++)
     hypers.hidden_size = get_config(policy_kwargs, "hidden_size");
+    hypers.critic_hidden = get_config(policy_kwargs, "critic_hidden");
     hypers.num_layers = get_config(policy_kwargs, "num_layers");
     // Learning rate
     hypers.lr = get_config(train_kwargs, "learning_rate");

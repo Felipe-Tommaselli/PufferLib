@@ -92,6 +92,11 @@ typedef struct StaticVec {
     float* gpu_truncations;
     void* gpu_final_observations;
     unsigned char* gpu_action_mask;  // NULL unless env defines MY_ACTION_MASK
+    float* privileged;           // NULL unless env defines MY_PRIVILEGED
+    float* final_privileged;
+    float* gpu_privileged;
+    float* gpu_final_privileged;
+    int privileged_size;         // 0 unless env defines MY_PRIVILEGED
     cudaStream_t* streams;
     StaticThreading* threading;
     int obs_size;
@@ -134,6 +139,7 @@ int get_num_atns(void);
 int* get_act_sizes(void);
 int get_num_act_sizes(void);
 const char* get_obs_dtype(void);
+int get_priv_size(void);
 size_t get_obs_elem_size(void);
 
 // Synchronous single-step
@@ -329,6 +335,14 @@ static void* static_omp_threadmanager(void* arg) {
                     cudaMemcpyHostToDevice, stream);
             }
 #endif
+#ifdef MY_PRIVILEGED
+            cudaMemcpyAsync(vec->gpu_privileged + agent_start * MY_PRIVILEGED,
+                vec->privileged + agent_start * MY_PRIVILEGED,
+                agents_per_buffer * MY_PRIVILEGED * sizeof(float), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(vec->gpu_final_privileged + agent_start * MY_PRIVILEGED,
+                vec->final_privileged + agent_start * MY_PRIVILEGED,
+                agents_per_buffer * MY_PRIVILEGED * sizeof(float), cudaMemcpyHostToDevice, stream);
+#endif
 #ifdef MY_ACTION_MASK
             cudaMemcpyAsync(
                 vec->gpu_action_mask + agent_start * MY_ACTION_MASK,
@@ -495,6 +509,26 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         vec->gpu_action_mask = vec->action_mask;
     }
 #endif
+
+#ifdef MY_PRIVILEGED
+    vec->privileged_size = MY_PRIVILEGED;
+    size_t priv_bytes = (size_t)total_agents * MY_PRIVILEGED * sizeof(float);
+    if (gpu) {
+        cudaHostAlloc((void**)&vec->privileged, priv_bytes, cudaHostAllocPortable);
+        cudaHostAlloc((void**)&vec->final_privileged, priv_bytes, cudaHostAllocPortable);
+        cudaMalloc((void**)&vec->gpu_privileged, priv_bytes);
+        cudaMalloc((void**)&vec->gpu_final_privileged, priv_bytes);
+        memset(vec->privileged, 0, priv_bytes);
+        memset(vec->final_privileged, 0, priv_bytes);
+        cudaMemset(vec->gpu_privileged, 0, priv_bytes);
+        cudaMemset(vec->gpu_final_privileged, 0, priv_bytes);
+    } else {
+        vec->privileged = (float*)calloc(total_agents * MY_PRIVILEGED, sizeof(float));
+        vec->final_privileged = (float*)calloc(total_agents * MY_PRIVILEGED, sizeof(float));
+        vec->gpu_privileged = vec->privileged;
+        vec->gpu_final_privileged = vec->final_privileged;
+    }
+#endif
     // No #else: action_mask, gpu_action_mask, action_mask_size are already 0/NULL
     // from calloc(1, sizeof(StaticVec)) above.
 
@@ -522,6 +556,10 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
 #endif
 #ifdef MY_ACTION_MASK
             env->action_mask = vec->action_mask + slot * MY_ACTION_MASK;
+#endif
+#ifdef MY_PRIVILEGED
+            env->privileged = vec->privileged + slot * MY_PRIVILEGED;
+            env->final_privileged = vec->final_privileged + slot * MY_PRIVILEGED;
 #endif
 #ifdef MY_USES_PERM
             // Populate per-slot pointer arrays. agent_perm is NULL here (identity),
@@ -622,6 +660,10 @@ void static_vec_reset(StaticVec* vec) {
             (size_t)vec->total_agents * MY_ACTION_MASK * sizeof(unsigned char),
             cudaMemcpyHostToDevice);
 #endif
+#ifdef MY_PRIVILEGED
+        cudaMemcpy(vec->gpu_privileged, vec->privileged,
+            (size_t)vec->total_agents * MY_PRIVILEGED * sizeof(float), cudaMemcpyHostToDevice);
+#endif
         cudaDeviceSynchronize();
     } else {
         memset(vec->rewards, 0, vec->total_agents * sizeof(float));
@@ -699,6 +741,12 @@ void static_vec_close(StaticVec* vec) {
         cudaFree(vec->gpu_action_mask);
         cudaFreeHost(vec->action_mask);
 #endif
+#ifdef MY_PRIVILEGED
+        cudaFree(vec->gpu_privileged);
+        cudaFree(vec->gpu_final_privileged);
+        cudaFreeHost(vec->privileged);
+        cudaFreeHost(vec->final_privileged);
+#endif
     } else {
         free(vec->observations);
         free(vec->actions);
@@ -707,6 +755,10 @@ void static_vec_close(StaticVec* vec) {
 #ifdef MY_TRUNCATION
         free(vec->truncations);
         free(vec->final_observations);
+#endif
+#ifdef MY_PRIVILEGED
+        free(vec->privileged);
+        free(vec->final_privileged);
 #endif
 #ifdef MY_ACTION_MASK
         free(vec->action_mask);
@@ -793,6 +845,11 @@ int* get_act_sizes(void) { return _act_sizes; }
 int get_num_act_sizes(void) { return (int)(sizeof(_act_sizes) / sizeof(_act_sizes[0])); }
 const char* get_obs_dtype(void) { return dtype_symbol; }
 size_t get_obs_elem_size(void) { return obs_element_size(); }
+#ifdef MY_PRIVILEGED
+int get_priv_size(void) { return MY_PRIVILEGED; }
+#else
+int get_priv_size(void) { return 0; }
+#endif
 
 static inline void _static_vec_env_step(StaticVec* vec) {
     memset(vec->rewards, 0, vec->total_agents * sizeof(float));
@@ -830,6 +887,12 @@ void gpu_vec_step(StaticVec* vec) {
             (char*)vec->final_observations + offset, OBS_SIZE * obs_element_size(),
             cudaMemcpyHostToDevice);
     }
+#endif
+#ifdef MY_PRIVILEGED
+    cudaMemcpy(vec->gpu_privileged, vec->privileged,
+        (size_t)vec->total_agents * MY_PRIVILEGED * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(vec->gpu_final_privileged, vec->final_privileged,
+        (size_t)vec->total_agents * MY_PRIVILEGED * sizeof(float), cudaMemcpyHostToDevice);
 #endif
 }
 

@@ -1634,8 +1634,9 @@ __global__ void nh_ptr3_dkmat_kernel(precision_t* __restrict__ dkmat,
 }
 
 static PrecisionTensor nethack_decoder_forward(void* w, void* activations, PrecisionTensor input,
-        PrecisionTensor obs, cudaStream_t stream) {
+        PrecisionTensor obs, PrecisionTensor priv, cudaStream_t stream) {
     (void)obs;
+    (void)priv;
     NethackDecoderWeights* dw = (NethackDecoderWeights*)w;
     NethackDecoderActivations* a = (NethackDecoderActivations*)activations;
     int B = input.shape[0];

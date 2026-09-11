@@ -49,6 +49,8 @@ struct RaptorEnv {
     float* terminals;
     float* truncations;
     float* final_observations;
+    float* privileged;
+    float* final_privileged;
     int num_agents;
     unsigned int rng;
 
@@ -159,6 +161,8 @@ void c_reset(RaptorEnv* env) {
         env->terminals[i] = 0;
         if (env->truncations) env->truncations[i] = 0;
         observe(&env->agents[i].state, env->observations + i * RAPTOR_OBS_DIM, env->obs_clip);
+        observe_privileged(&env->agents[i].state, &env->agents[i].airframe, &env->airframe,
+                           env->privileged + i * RAPTOR_PRIV_DIM);
     }
 }
 
@@ -222,14 +226,19 @@ void c_step(RaptorEnv* env) {
         env->rewards[i] = r;
         env->terminals[i] = (term || truncated) ? 1.0f : 0.0f;
         if (env->truncations) env->truncations[i] = truncated && !term;
-        if (truncated && !term && env->final_observations)
+        if (truncated && !term && env->final_observations) {
             observe(&agent->state, env->final_observations + i * RAPTOR_OBS_DIM, env->obs_clip);
+            observe_privileged(&agent->state, &agent->airframe, &env->airframe,
+                               env->final_privileged + i * RAPTOR_PRIV_DIM);
+        }
 
         if (term || truncated) {
             add_log(env, agent, term);
             reset_agent(env, i);
         }
         observe(&agent->state, env->observations + i * RAPTOR_OBS_DIM, env->obs_clip);
+        observe_privileged(&agent->state, &agent->airframe, &env->airframe,
+                           env->privileged + i * RAPTOR_PRIV_DIM);
     }
 }
 

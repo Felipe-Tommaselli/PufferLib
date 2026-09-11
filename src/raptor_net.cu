@@ -470,14 +470,16 @@ static void create_raptor_network(Network* net) {
     };
 }
 
-static constexpr int RN_OBS = 22, RN_CRITIC = 256, RN_HID = 16, RN_CIN = RN_OBS + RN_HID;
+static constexpr int RN_OBS = 22, RN_PRIV = 17, RN_HID = 16, RN_CIN = RN_OBS + RN_PRIV + RN_HID;
+static constexpr int RN_CRITIC_DEFAULT = 256;
 
 __global__ void rn_concat(precision_t* dst, const precision_t* h, const precision_t* obs,
-        int H, int O, int n) {
+        const precision_t* priv, int H, int O, int P, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    int b = i / (H + O), j = i % (H + O);
-    dst[i] = (j < H) ? h[b * H + j] : obs[b * O + j - H];
+    int W = H + O + P, b = i / W, j = i % W;
+    dst[i] = (j < H) ? h[b * H + j]
+           : (j < H + O) ? obs[b * O + j - H] : priv[b * P + j - H - O];
 }
 
 // prefix must mirror DecoderWeights: pufferlib.cu casts every decoder to it for logstd
@@ -486,6 +488,7 @@ struct RaptorDecWeights {
     int hidden_dim, output_dim;
     bool continuous;
     PrecisionTensor b, c1w, c1b, c2w, c2b, c3w, c3b;
+    int critic_hidden;
 };
 
 struct RaptorDecActs {
@@ -528,23 +531,23 @@ __global__ void rn_split_grad(precision_t* dact, precision_t* dval, const float*
 }
 
 static PrecisionTensor raptor_dec_forward(void* w, void* activations, PrecisionTensor input,
-        PrecisionTensor obs, cudaStream_t stream) {
+        PrecisionTensor obs, PrecisionTensor priv, cudaStream_t stream) {
     RaptorDecWeights* dw = (RaptorDecWeights*)w;
     RaptorDecActs* a = (RaptorDecActs*)activations;
     int B = numel(input.shape) / dw->hidden_dim, A = dw->output_dim;
-    int H = dw->hidden_dim;
+    int H = dw->hidden_dim, C = dw->critic_hidden;
     if (a->saved_h.data) puf_copy(&a->saved_h, &input, stream);
     puf_mm(&input, &dw->w, &a->act, stream);
     rn_bias<<<grid_size(B * A), BLOCK_SIZE, 0, stream>>>(a->act.data, dw->b.data, B * A, A);
     // detached: the concat is a fresh buffer, so no critic gradient reaches the GRU
-    rn_concat<<<grid_size(B * (H + RN_OBS)), BLOCK_SIZE, 0, stream>>>(a->cin.data, input.data,
-        obs.data, H, RN_OBS, B * (H + RN_OBS));
+    rn_concat<<<grid_size(B * RN_CIN), BLOCK_SIZE, 0, stream>>>(a->cin.data, input.data,
+        obs.data, priv.data, H, RN_OBS, RN_PRIV, B * RN_CIN);
     puf_mm(&a->cin, &dw->c1w, &a->k1, stream);
-    rn_bias_tanh<<<grid_size(B * RN_CRITIC), BLOCK_SIZE, 0, stream>>>(a->k1.data, dw->c1b.data,
-        B * RN_CRITIC, RN_CRITIC);
+    rn_bias_tanh<<<grid_size(B * C), BLOCK_SIZE, 0, stream>>>(a->k1.data, dw->c1b.data,
+        B * C, C);
     puf_mm(&a->k1, &dw->c2w, &a->k2, stream);
-    rn_bias_tanh<<<grid_size(B * RN_CRITIC), BLOCK_SIZE, 0, stream>>>(a->k2.data, dw->c2b.data,
-        B * RN_CRITIC, RN_CRITIC);
+    rn_bias_tanh<<<grid_size(B * C), BLOCK_SIZE, 0, stream>>>(a->k2.data, dw->c2b.data,
+        B * C, C);
     puf_mm(&a->k2, &dw->c3w, &a->val, stream);
     rn_bias<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(a->val.data, dw->c3b.data, B, 1);
     rn_assemble<<<grid_size(B * (A + 1)), BLOCK_SIZE, 0, stream>>>(a->out.data, a->act.data,
@@ -556,7 +559,7 @@ static PrecisionTensor raptor_dec_backward(void* w, void* activations, FloatTens
         FloatTensor grad_logstd, FloatTensor grad_value, cudaStream_t stream) {
     RaptorDecWeights* dw = (RaptorDecWeights*)w;
     RaptorDecActs* a = (RaptorDecActs*)activations;
-    int A = dw->output_dim, B = grad_logits.shape[0];
+    int A = dw->output_dim, B = grad_logits.shape[0], C = dw->critic_hidden;
     rn_split_grad<<<grid_size(B * A), BLOCK_SIZE, 0, stream>>>(a->dact.data, a->dval.data,
         grad_logits.data, grad_value.data, B, A);
     puf_mm_tn(&a->dact, &a->saved_h, &a->wgrad, stream);
@@ -569,17 +572,15 @@ static PrecisionTensor raptor_dec_backward(void* w, void* activations, FloatTens
     puf_mm_tn(&a->dval, &a->k2, &a->c3wgrad, stream);
     rn_col_sum<<<grid_size(1), BLOCK_SIZE, 0, stream>>>(a->c3bgrad.data, a->dval.data, B, 1);
     puf_mm_nn(&a->dval, &dw->c3w, &a->dk2, stream);
-    rn_tanh_bwd<<<grid_size(B * RN_CRITIC), BLOCK_SIZE, 0, stream>>>(a->dk2.data, a->dk2.data,
-        a->k2.data, B * RN_CRITIC);
+    rn_tanh_bwd<<<grid_size(B * C), BLOCK_SIZE, 0, stream>>>(a->dk2.data, a->dk2.data,
+        a->k2.data, B * C);
     puf_mm_tn(&a->dk2, &a->k1, &a->c2wgrad, stream);
-    rn_col_sum<<<grid_size(RN_CRITIC), BLOCK_SIZE, 0, stream>>>(a->c2bgrad.data, a->dk2.data, B,
-        RN_CRITIC);
+    rn_col_sum<<<grid_size(C), BLOCK_SIZE, 0, stream>>>(a->c2bgrad.data, a->dk2.data, B, C);
     puf_mm_nn(&a->dk2, &dw->c2w, &a->dk1, stream);
-    rn_tanh_bwd<<<grid_size(B * RN_CRITIC), BLOCK_SIZE, 0, stream>>>(a->dk1.data, a->dk1.data,
-        a->k1.data, B * RN_CRITIC);
+    rn_tanh_bwd<<<grid_size(B * C), BLOCK_SIZE, 0, stream>>>(a->dk1.data, a->dk1.data,
+        a->k1.data, B * C);
     puf_mm_tn(&a->dk1, &a->cin, &a->c1wgrad, stream);
-    rn_col_sum<<<grid_size(RN_CRITIC), BLOCK_SIZE, 0, stream>>>(a->c1bgrad.data, a->dk1.data, B,
-        RN_CRITIC);
+    rn_col_sum<<<grid_size(C), BLOCK_SIZE, 0, stream>>>(a->c1bgrad.data, a->dk1.data, B, C);
     return a->grad_input;
 }
 
@@ -613,11 +614,12 @@ static void raptor_dec_reg_params(void* w, Allocator* alloc) {
         dw->logstd = {.shape = {1, dw->output_dim}};
         alloc_register(alloc, &dw->logstd);
     }
-    dw->c1w = {.shape = {RN_CRITIC, RN_CIN}};
-    dw->c1b = {.shape = {RN_CRITIC}};
-    dw->c2w = {.shape = {RN_CRITIC, RN_CRITIC}};
-    dw->c2b = {.shape = {RN_CRITIC}};
-    dw->c3w = {.shape = {1, RN_CRITIC}};
+    int C = dw->critic_hidden;
+    dw->c1w = {.shape = {C, RN_CIN}};
+    dw->c1b = {.shape = {C}};
+    dw->c2w = {.shape = {C, C}};
+    dw->c2b = {.shape = {C}};
+    dw->c3w = {.shape = {1, C}};
     dw->c3b = {.shape = {1}};
     for (PrecisionTensor* t : {&dw->c1w, &dw->c1b, &dw->c2w, &dw->c2b, &dw->c3w, &dw->c3b})
         alloc_register(alloc, t);
@@ -627,19 +629,19 @@ static void raptor_dec_reg_train(void* w, void* activations, Allocator* acts, Al
         int B_TT) {
     RaptorDecWeights* dw = (RaptorDecWeights*)w;
     RaptorDecActs* a = (RaptorDecActs*)activations;
-    int A = dw->output_dim, H = dw->hidden_dim;
+    int A = dw->output_dim, H = dw->hidden_dim, C = dw->critic_hidden;
     *a = (RaptorDecActs){};
     a->out = {.shape = {B_TT, A + 1}};
     a->act = {.shape = {B_TT, A}};
     a->val = {.shape = {B_TT, 1}};
-    a->k1 = {.shape = {B_TT, RN_CRITIC}};
-    a->k2 = {.shape = {B_TT, RN_CRITIC}};
+    a->k1 = {.shape = {B_TT, C}};
+    a->k2 = {.shape = {B_TT, C}};
     a->saved_h = {.shape = {B_TT, H}};
     a->cin = {.shape = {B_TT, RN_CIN}};
     a->dact = {.shape = {B_TT, A}};
     a->dval = {.shape = {B_TT, 1}};
-    a->dk1 = {.shape = {B_TT, RN_CRITIC}};
-    a->dk2 = {.shape = {B_TT, RN_CRITIC}};
+    a->dk1 = {.shape = {B_TT, C}};
+    a->dk2 = {.shape = {B_TT, C}};
     a->grad_input = {.shape = {B_TT, H}};
     for (PrecisionTensor* t : {&a->out, &a->act, &a->val, &a->k1, &a->k2, &a->saved_h,
             &a->cin, &a->dact, &a->dval, &a->dk1, &a->dk2, &a->grad_input})
@@ -647,11 +649,11 @@ static void raptor_dec_reg_train(void* w, void* activations, Allocator* acts, Al
     a->wgrad = {.shape = {A, H}};
     a->bgrad = {.shape = {A}};
     a->logstd_grad = {.shape = {1, A}};
-    a->c1wgrad = {.shape = {RN_CRITIC, RN_CIN}};
-    a->c1bgrad = {.shape = {RN_CRITIC}};
-    a->c2wgrad = {.shape = {RN_CRITIC, RN_CRITIC}};
-    a->c2bgrad = {.shape = {RN_CRITIC}};
-    a->c3wgrad = {.shape = {1, RN_CRITIC}};
+    a->c1wgrad = {.shape = {C, RN_CIN}};
+    a->c1bgrad = {.shape = {C}};
+    a->c2wgrad = {.shape = {C, C}};
+    a->c2bgrad = {.shape = {C}};
+    a->c3wgrad = {.shape = {1, C}};
     a->c3bgrad = {.shape = {1}};
     alloc_register(grads, &a->wgrad);
     alloc_register(grads, &a->bgrad);
@@ -668,8 +670,8 @@ static void raptor_dec_reg_rollout(void* w, void* activations, Allocator* alloc,
     a->out = {.shape = {B, dw->output_dim + 1}};
     a->act = {.shape = {B, dw->output_dim}};
     a->val = {.shape = {B, 1}};
-    a->k1 = {.shape = {B, RN_CRITIC}};
-    a->k2 = {.shape = {B, RN_CRITIC}};
+    a->k1 = {.shape = {B, dw->critic_hidden}};
+    a->k2 = {.shape = {B, dw->critic_hidden}};
     a->cin = {.shape = {B, RN_CIN}};
     for (PrecisionTensor* t : {&a->out, &a->act, &a->val, &a->k1, &a->k2, &a->cin})
         alloc_register(alloc, t);
@@ -681,6 +683,7 @@ static void* raptor_dec_create_weights(void* self) {
     dw->hidden_dim = d->hidden_dim;
     dw->output_dim = d->output_dim;
     dw->continuous = d->continuous;
+    dw->critic_hidden = d->critic_hidden > 0 ? d->critic_hidden : RN_CRITIC_DEFAULT;
     return dw;
 }
 
@@ -697,6 +700,7 @@ static void create_raptor_decoder(Decoder* dec) {
         .free_activations = raptor_free,
         .hidden_dim = dec->hidden_dim,
         .output_dim = dec->output_dim,
+        .critic_hidden = dec->critic_hidden,
         .continuous = dec->continuous,
         .activation_size = (int)sizeof(RaptorDecActs),
     };

@@ -9,7 +9,7 @@
 #include "raptor_net.cu"
 #include "muon.cu"
 
-static constexpr int OBS = 22, HID = 16, ACT = 4;
+static constexpr int OBS = 22, PRIV = 17, HID = 16, ACT = 4;
 
 static std::vector<float> read_file(const char* path, size_t offset_bytes) {
     FILE* f = fopen(path, "rb");
@@ -286,11 +286,12 @@ static int gradcheck(bool with_dones) {
 
 // Muon updates the flat weight buffer with the flat gradient buffer positionally, so the
 // k-th gradient must sit at the same offset and size as the k-th parameter.
-static int layout(bool emit = false) {
+static int layout(bool emit = false, int critic_hidden = 0) {
     int TT = 8, B = 4;
     Encoder enc = {.in_dim = OBS, .out_dim = HID};
     create_raptor_encoder(&enc);
-    Decoder dec = {.hidden_dim = HID, .output_dim = ACT, .continuous = true};
+    Decoder dec = {.hidden_dim = HID, .output_dim = ACT, .critic_hidden = critic_hidden,
+        .continuous = true};
     create_raptor_decoder(&dec);
     Network net = {.hidden = HID, .num_layers = 1, .horizon = TT};
     create_raptor_network(&net);
@@ -420,9 +421,10 @@ static int decoder_grad() {
     upload(&d->w, pw.data() + 2016);
     upload(&d->b, pw.data() + 2080);
     srand(11);
-    std::vector<float> hid(BT * HID), obs(BT * OBS), gl(BT * ACT), gv(BT);
+    std::vector<float> hid(BT * HID), obs(BT * OBS), priv(BT * PRIV), gl(BT * ACT), gv(BT);
     for (float& v : hid) v = 2.0f * rand() / RAND_MAX - 1.0f;
     for (float& v : obs) v = 2.0f * rand() / RAND_MAX - 1.0f;
+    for (float& v : priv) v = 2.0f * rand() / RAND_MAX - 1.0f;
     for (float& v : gl) v = 2.0f * rand() / RAND_MAX - 1.0f;
     for (float& v : gv) v = 2.0f * rand() / RAND_MAX - 1.0f;
     std::vector<float> cw(numel(d->c1w.shape) + numel(d->c2w.shape) + numel(d->c3w.shape));
@@ -431,11 +433,13 @@ static int decoder_grad() {
     upload(&d->c2w, cw.data() + numel(d->c1w.shape));
     upload(&d->c3w, cw.data() + numel(d->c1w.shape) + numel(d->c2w.shape));
 
-    PrecisionTensor h = {.shape = {BT, HID}}, o = {.shape = {BT, OBS}};
+    PrecisionTensor h = {.shape = {BT, HID}}, o = {.shape = {BT, OBS}}, p = {.shape = {BT, PRIV}};
     cudaMalloc(&h.data, hid.size() * sizeof(float));
     cudaMalloc(&o.data, obs.size() * sizeof(float));
+    cudaMalloc(&p.data, priv.size() * sizeof(float));
     cudaMemcpy(h.data, hid.data(), hid.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(o.data, obs.data(), obs.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(p.data, priv.data(), priv.size() * sizeof(float), cudaMemcpyHostToDevice);
     FloatTensor fl = {.shape = {BT, ACT}}, fv = {.shape = {BT}}, fs = {};
     cudaMalloc(&fl.data, gl.size() * sizeof(float));
     cudaMalloc(&fv.data, gv.size() * sizeof(float));
@@ -444,7 +448,7 @@ static int decoder_grad() {
 
     std::vector<float> host(BT * (ACT + 1));
     auto loss = [&]() {
-        PrecisionTensor out = dec.forward(dwp, dec_a, h, o, 0);
+        PrecisionTensor out = dec.forward(dwp, dec_a, h, o, p, 0);
         cudaDeviceSynchronize();
         cudaMemcpy(host.data(), out.data, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
         double s = 0;
@@ -459,6 +463,18 @@ static int decoder_grad() {
     dec.backward(dwp, dec_a, fl, fs, fv, 0);
     cudaDeviceSynchronize();
 
+    std::vector<float> cin(BT * (HID + OBS + PRIV));
+    cudaMemcpy(cin.data(), da->cin.data, cin.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    int wrong = 0;
+    for (int r = 0; r < BT; r++) {
+        const float* row = cin.data() + r * (HID + OBS + PRIV);
+        for (int k = 0; k < HID; k++) wrong += row[k] != hid[r * HID + k];
+        for (int k = 0; k < OBS; k++) wrong += row[HID + k] != obs[r * OBS + k];
+        for (int k = 0; k < PRIV; k++) wrong += row[HID + OBS + k] != priv[r * PRIV + k];
+    }
+    printf("critic input is hidden|obs|privileged, %d misplaced  %s\n", wrong,
+           wrong ? "FAIL" : "PASS");
+
     struct Item { const char* name; PrecisionTensor* w; PrecisionTensor* grad; };
     Item items[] = {
         {"dec.w", &d->w, &da->wgrad}, {"dec.b", &d->b, &da->bgrad},
@@ -466,7 +482,7 @@ static int decoder_grad() {
         {"critic.c2w", &d->c2w, &da->c2wgrad}, {"critic.c3w", &d->c3w, &da->c3wgrad},
         {"critic.c3b", &d->c3b, &da->c3bgrad},
     };
-    int fails = 0;
+    int fails = wrong != 0;
     float eps = 1e-3f;
     for (Item& it : items) {
         int total = numel(it.w->shape);
@@ -559,7 +575,8 @@ static int blob_init() {
 }
 
 int main(int argc, char** argv) {
-    if (argc > 1 && strcmp(argv[1], "--layout") == 0) return layout(true);
+    if (argc > 1 && strcmp(argv[1], "--layout") == 0)
+        return layout(true, argc > 2 ? atoi(argv[2]) : 0);
     int fails = parity() + parity_rollout() + gradcheck(false) + gradcheck(true) + layout()
         + optim_placement() + decoder_grad() + blob_init();
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

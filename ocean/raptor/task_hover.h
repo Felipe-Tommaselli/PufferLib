@@ -44,6 +44,24 @@ static void observe(const State* s, float* obs, bool clip) {
     for (int i = 0; i < 4; i++) obs[18 + i] = s->last_action[i];
 }
 
+static void observe_privileged(const State* s, const Airframe* p, const Airframe* nominal,
+                               float* priv) {
+    float ratio[10] = {p->mass / nominal->mass,
+        p->rotor_thrust_coefficients[0][2] / nominal->rotor_thrust_coefficients[0][2],
+        p->rotor_torque_constants[0] / nominal->rotor_torque_constants[0],
+        p->rotor_time_constants_rising[0] / nominal->rotor_time_constants_rising[0],
+        p->rotor_time_constants_falling[0] / nominal->rotor_time_constants_falling[0],
+        p->rotor_positions[0][0] / nominal->rotor_positions[0][0],
+        p->J[0][0] / nominal->J[0][0], p->J[1][1] / nominal->J[1][1], p->J[2][2] / nominal->J[2][2],
+        p->hovering_throttle_relative / nominal->hovering_throttle_relative};
+    for (int i = 0; i < 10; i++) priv[i] = 10.0f * (ratio[i] - 1.0f);
+    for (int i = 0; i < 4; i++) priv[10 + i] = s->rpm[i];
+    float c = cosf(s->target_yaw), sn = sinf(s->target_yaw);
+    priv[14] = c * s->target_velocity[0] + sn * s->target_velocity[1];
+    priv[15] = -sn * s->target_velocity[0] + c * s->target_velocity[1];
+    priv[16] = s->target_velocity[2];
+}
+
 static bool terminated(const TerminationParams* t, const State* s) {
     for (int i = 0; i < 3; i++)
         if (isnan(s->position[i]) || isnan(s->linear_velocity[i]) || isnan(s->angular_velocity[i])) return true;

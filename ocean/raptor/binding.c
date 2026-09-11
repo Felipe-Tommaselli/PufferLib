@@ -5,6 +5,7 @@
 #define ACT_SIZES {1, 1, 1, 1}
 #define OBS_TENSOR_T FloatTensor
 
+#define MY_PRIVILEGED RAPTOR_PRIV_DIM
 #define MY_TRUNCATION
 #define Env RaptorEnv
 #include "vecenv.h"

@@ -34,6 +34,8 @@ static RaptorEnv* make_env(int num_agents, unsigned int seed) {
     env->terminals = (float*)calloc(num_agents, sizeof(float));
     env->truncations = (float*)calloc(num_agents, sizeof(float));
     env->final_observations = (float*)calloc(num_agents * RAPTOR_OBS_DIM, sizeof(float));
+    env->privileged = (float*)calloc(num_agents * RAPTOR_PRIV_DIM, sizeof(float));
+    env->final_privileged = (float*)calloc(num_agents * RAPTOR_PRIV_DIM, sizeof(float));
     init(env);
     return env;
 }
@@ -46,6 +48,8 @@ static void free_env(RaptorEnv* env) {
     free(env->terminals);
     free(env->truncations);
     free(env->final_observations);
+    free(env->privileged);
+    free(env->final_privileged);
     free(env);
 }
 
@@ -201,10 +205,12 @@ static void test_buffer_contract(void) {
         c_step(env);
         for (int i = 0; i < 4096 * RAPTOR_OBS_DIM; i++)
             if (!isfinite(env->observations[i])) finite = false;
+        for (int i = 0; i < 4096 * RAPTOR_PRIV_DIM; i++)
+            if (!isfinite(env->privileged[i])) finite = false;
         for (int i = 0; i < 4096; i++)
             if (!isfinite(env->rewards[i]) || !isfinite(env->terminals[i])) finite = false;
     }
-    check("T1 buffer contract", finite, "4096 agents x 1000 steps, all finite");
+    check("T1 buffer contract", finite, "4096 agents x 1000 steps, obs and privileged finite");
     free_env(env);
 }
 
@@ -224,8 +230,10 @@ static void test_determinism(void) {
         c_step(b);
         for (int i = 0; i < 256 * RAPTOR_OBS_DIM; i++)
             if (a->observations[i] != b->observations[i]) same = false;
+        for (int i = 0; i < 256 * RAPTOR_PRIV_DIM; i++)
+            if (a->privileged[i] != b->privileged[i]) same = false;
     }
-    check("T12 determinism", same, "same seed, bit-identical observations");
+    check("T12 determinism", same, "same seed, bit-identical observations and privileged");
     free_env(a);
     free_env(b);
 }
@@ -341,6 +349,25 @@ static void test_native_contract(void) {
     randomize_airframe(&nominal, 0, &seed);
     bounds &= memcmp(&nominal, &AIRFRAME_IMAV, sizeof(nominal)) == 0;
     check("T16 DR envelope", bounds, "mass/thrust 15%, others 4%, positive plant and nominal dr=0");
+
+    RaptorEnv* env = make_env(64, 23);
+    c_reset(env);
+    for (int i = 0; i < 64 * RAPTOR_ACT_DIM; i++) env->actions[i] = rnd_uniform(&env->rng, -1, 1);
+    c_step(env);
+    bool mirrors = true;
+    for (int i = 0; i < 64; i++) {
+        const float* p = env->privileged + i * RAPTOR_PRIV_DIM;
+        const State* s = &env->agents[i].state;
+        const Airframe* a = &env->agents[i].airframe;
+        mirrors &= fabsf(p[0] - 10 * (a->mass / env->airframe.mass - 1)) < 1e-6f;
+        for (int k = 0; k < 4; k++) mirrors &= p[10 + k] == s->rpm[k];
+        float c = cosf(s->target_yaw), sn = sinf(s->target_yaw);
+        mirrors &= fabsf(p[14] - (c * s->target_velocity[0] + sn * s->target_velocity[1])) < 1e-6f;
+        mirrors &= fabsf(p[16] - s->target_velocity[2]) < 1e-6f;
+    }
+    check("T20 privileged critic input", mirrors,
+          "sampled plant ratios, motor states and target-frame command velocity");
+    free_env(env);
 }
 
 static void test_command_continuity(void) {

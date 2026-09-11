@@ -3,6 +3,7 @@
 #define RAPTOR_DT 0.01f
 #define RAPTOR_HORIZON 500
 #define RAPTOR_OBS_DIM 22
+#define RAPTOR_PRIV_DIM 17
 #define RAPTOR_ACT_DIM 4
 
 typedef struct {
